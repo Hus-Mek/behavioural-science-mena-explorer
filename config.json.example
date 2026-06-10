@@ -1,0 +1,11 @@
+# config.json
+
+Copy this file and fill in your OpenRouter API key:
+
+```json
+{
+  "openrouter_api_key": "your-key-here"
+}
+```
+
+Get your key at https://openrouter.ai/keys

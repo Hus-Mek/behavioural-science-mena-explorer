@@ -1,0 +1,2 @@
+# No external dependencies required - uses only Python stdlib
+# This file is kept for Docker/pip compatibility

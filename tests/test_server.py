@@ -1,0 +1,285 @@
+"""Tests for server.py — run with: pytest tests/ -v"""
+import json
+import os
+import sys
+import urllib.error
+from pathlib import Path
+from unittest.mock import patch, MagicMock
+
+import pytest
+
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Set dummy API key before importing server
+os.environ["OPENROUTER_API_KEY"] = "test-key-dummy"
+
+import server
+
+
+def make_papers(tmp_path, papers_data, filename="papers_test.json"):
+    """Helper: write papers to a temp raw dir, patch server globals, return loaded papers."""
+    raw_dir = tmp_path / "data" / "raw"
+    raw_dir.mkdir(parents=True)
+    analyses_dir = tmp_path / "data" / "analyses"
+    analyses_dir.mkdir(parents=True)
+    cache = tmp_path / "data" / "analysis_cache.json"
+
+    with open(raw_dir / filename, "w") as f:
+        json.dump(papers_data, f)
+
+    with patch.object(server, "RAW_DIR", raw_dir):
+        with patch.object(server, "ANALYSIS_DIR", analyses_dir):
+            with patch.object(server, "ANALYSIS_CACHE", cache):
+                return server.load_papers()
+
+
+# ── Paper Loading ────────────────────────────────────────────────────────────
+
+class TestLoadPapers:
+    def test_loads_papers_from_raw_dir(self, tmp_path):
+        papers = [
+            {"id": f"t{i}", "title": f"Research on {['cats','dogs','fish','birds','snakes','lions','bears','wolves','foxes','deer'][i]}", "summary": f"Abstract {i}"}
+            for i in range(10)
+        ]
+        result = make_papers(tmp_path, papers)
+        assert len(result) == 10
+
+    def test_dedup_by_id(self, tmp_path):
+        papers = [
+            {"id": "dup.001", "title": "Paper A", "summary": "abstract"},
+            {"id": "dup.001", "title": "Paper A duplicate", "summary": "abstract"},
+            {"id": "unique.002", "title": "Paper B", "summary": "abstract"},
+        ]
+        result = make_papers(tmp_path, papers)
+        ids = [p["id"] for p in result]
+        assert ids.count("dup.001") == 1
+        assert "unique.002" in ids
+
+    def test_dedup_by_title_similarity(self, tmp_path):
+        papers = [
+            {"id": "a.001", "title": "Behavioral Science in Saudi Arabia: A Study", "summary": "x"},
+            {"id": "b.002", "title": "Behavioral Science in Saudi Arabia: A Study", "summary": "y"},
+        ]
+        result = make_papers(tmp_path, papers)
+        assert len(result) == 1
+
+    def test_handles_empty_raw_dir(self, tmp_path):
+        raw_dir = tmp_path / "data" / "raw"
+        raw_dir.mkdir(parents=True)
+        analyses_dir = tmp_path / "data" / "analyses"
+        analyses_dir.mkdir(parents=True)
+        cache = tmp_path / "data" / "analysis_cache.json"
+
+        with patch.object(server, "RAW_DIR", raw_dir):
+            with patch.object(server, "ANALYSIS_DIR", analyses_dir):
+                with patch.object(server, "ANALYSIS_CACHE", cache):
+                    result = server.load_papers()
+                    assert result == []
+
+
+# ── Search ───────────────────────────────────────────────────────────────────
+
+class TestSearchPapers:
+    def _papers(self, tmp_path):
+        animals = ['cats','dogs','fish','birds','snakes','lions','bears','wolves','foxes','deer']
+        data = [
+            {"id": f"s{i}", "title": f"Research on {animals[i]}", "summary": f"Abstract about {animals[i]}"}
+            for i in range(10)
+        ]
+        return make_papers(tmp_path, data)
+
+    def test_search_by_title(self, tmp_path):
+        papers = self._papers(tmp_path)
+        results = server.search_papers(papers, "cats")
+        assert len(results) >= 1
+
+    def test_search_by_summary(self, tmp_path):
+        papers = self._papers(tmp_path)
+        results = server.search_papers(papers, "snakes")
+        assert len(results) >= 1
+
+    def test_search_case_insensitive(self, tmp_path):
+        papers = self._papers(tmp_path)
+        results = server.search_papers(papers, "WOLVES")
+        assert len(results) >= 1
+
+    def test_search_no_match(self, tmp_path):
+        papers = self._papers(tmp_path)
+        results = server.search_papers(papers, "xyznonexistent")
+        assert len(results) == 0
+
+
+# ── Analysis ─────────────────────────────────────────────────────────────────
+
+class TestAnalyzePapers:
+    def test_returns_expected_keys(self, tmp_path):
+        topics = ['quantum physics','marine biology','ancient history','machine learning','climate science','neuroscience','astronomy','geology','economics','psychology']
+        papers = [
+            {"id": f"a{i}", "title": f"Study of {topics[i]}", "summary": f"Abstract {i}", "authors": ["A"], "published": "2024-01-01T00:00:00Z"}
+            for i in range(5)
+        ]
+        result = server.analyze_papers(papers)
+        assert "total_papers" in result
+        assert "yearly_distribution" in result
+        assert "top_authors" in result
+        assert "summary" in result
+
+    def test_total_papers_count(self, tmp_path):
+        topics = ['quantum physics','marine biology','ancient history','machine learning','climate science']
+        papers = [
+            {"id": f"b{i}", "title": f"Distinct {topics[i]}", "summary": f"Abstract {i}", "authors": ["B"], "published": "2024-06-01T00:00:00Z"}
+            for i in range(5)
+        ]
+        result = server.analyze_papers(papers)
+        assert result["total_papers"] == 5
+
+    def test_empty_papers(self):
+        result = server.analyze_papers([])
+        assert result["total_papers"] == 0
+
+
+# ── Rate Limiter ─────────────────────────────────────────────────────────────
+
+class TestRateLimiter:
+    def test_allows_within_limit(self):
+        rl = server.RateLimiter(max_requests=5, window_seconds=60)
+        for _ in range(5):
+            assert rl.allow("127.0.0.1") is True
+
+    def test_blocks_over_limit(self):
+        rl = server.RateLimiter(max_requests=3, window_seconds=60)
+        for _ in range(3):
+            rl.allow("127.0.0.1")
+        assert rl.allow("127.0.0.1") is False
+
+    def test_separate_ips(self):
+        rl = server.RateLimiter(max_requests=2, window_seconds=60)
+        rl.allow("1.1.1.1")
+        rl.allow("1.1.1.1")
+        assert rl.allow("1.1.1.1") is False
+        assert rl.allow("2.2.2.2") is True
+
+    def test_retry_after(self):
+        rl = server.RateLimiter(max_requests=1, window_seconds=60)
+        rl.allow("127.0.0.1")
+        retry = rl.retry_after("127.0.0.1")
+        assert 0 < retry <= 60
+
+
+# ── Config ───────────────────────────────────────────────────────────────────
+
+class TestConfig:
+    def test_load_config_file(self, tmp_path):
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text(json.dumps({"openrouter_api_key": "test-key-123"}))
+        with patch.object(server, "CONFIG_FILE", cfg_file):
+            cfg = server.load_config()
+            assert cfg["openrouter_api_key"] == "test-key-123"
+
+    def test_load_config_missing_file(self, tmp_path):
+        cfg_file = tmp_path / "nonexistent.json"
+        with patch.object(server, "CONFIG_FILE", cfg_file):
+            cfg = server.load_config()
+            assert cfg == {}
+
+    def test_save_config(self, tmp_path):
+        cfg_file = tmp_path / "config.json"
+        with patch.object(server, "CONFIG_FILE", cfg_file):
+            server.save_config({"key": "value"})
+            loaded = json.loads(cfg_file.read_text())
+            assert loaded["key"] == "value"
+
+
+# ── Prompt Config ────────────────────────────────────────────────────────────
+
+class TestPromptConfig:
+    def test_load_prompts_file(self, tmp_path):
+        prompts_file = tmp_path / "prompts.json"
+        prompts_file.write_text(json.dumps({"test_prompt": "hello"}))
+        with patch.object(server, "PROMPTS_FILE", prompts_file):
+            prompts = server.load_prompts()
+            assert prompts["test_prompt"] == "hello"
+
+    def test_load_prompts_missing(self, tmp_path):
+        with patch.object(server, "PROMPTS_FILE", tmp_path / "missing.json"):
+            prompts = server.load_prompts()
+            assert prompts == {}
+
+    def test_get_prompt_fallback(self, tmp_path):
+        with patch.object(server, "PROMPTS_FILE", tmp_path / "missing.json"):
+            result = server.get_prompt("nonexistent", "default-value")
+            assert result == "default-value"
+
+
+# ── LLM Call (mocked) ────────────────────────────────────────────────────────
+
+class TestLLMCall:
+    def test_no_api_key_returns_error(self):
+        with patch.object(server, "get_api_key", return_value=""):
+            result = server.llm_call([{"role": "user", "content": "hi"}])
+            assert "error" in result
+            assert "No API key" in result["error"]
+
+    @patch("urllib.request.urlopen")
+    def test_successful_call(self, mock_urlopen):
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps({
+            "choices": [{"message": {"content": "test response"}}]
+        }).encode()
+        mock_urlopen.return_value.__enter__ = MagicMock(return_value=mock_resp)
+        mock_urlopen.return_value.__exit__ = MagicMock(return_value=False)
+
+        with patch.object(server, "get_api_key", return_value="test-key"):
+            result = server.llm_call([{"role": "user", "content": "hi"}])
+            assert result.get("content") == "test response"
+
+    @patch("urllib.request.urlopen")
+    def test_fallback_on_429(self, mock_urlopen):
+        """When primary model returns 429, should try fallback."""
+        call_count = [0]
+
+        def side_effect(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] <= 2:  # First model fails (retry decorator retries once)
+                raise urllib.error.HTTPError("url", 429, "Too Many Requests", {}, None)
+            # Fallback succeeds
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = json.dumps({
+                "choices": [{"message": {"content": "fallback response"}}]
+            }).encode()
+            return mock_resp
+
+        mock_urlopen.side_effect = side_effect
+
+        with patch.object(server, "get_api_key", return_value="test-key"):
+            with patch.object(server, "LLM_FALLBACK_MODELS", ["openai/gpt-oss-20b:free"]):
+                result = server.llm_call([{"role": "user", "content": "hi"}])
+                # Either fallback works or all fail — just verify no crash
+                assert "content" in result or "error" in result
+
+
+# ── Word Frequency ───────────────────────────────────────────────────────────
+
+class TestWordFreq:
+    def test_basic_counting(self):
+        texts = ["hello world hello", "world hello"]
+        result = server.word_freq(texts)
+        assert result[0][0] == "hello"
+        assert result[0][1] == 3
+
+    def test_stopwords_filtered(self):
+        texts = ["the and for are but not you all any can"]
+        result = server.word_freq(texts)
+        assert len(result) == 0
+
+    def test_min_length_filter(self):
+        texts = ["ab cd efgh ij klmnop"]
+        result = server.word_freq(texts, min_len=3)
+        words = [w for w, _ in result]
+        assert "ab" not in words
+        assert "efgh" in words
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

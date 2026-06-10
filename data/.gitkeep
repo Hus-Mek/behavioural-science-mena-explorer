@@ -1,0 +1,3 @@
+# Data directory
+# Large data files (papers_*.json, analysis_cache.json) are gitignored
+# Add small metadata or README files here if needed
