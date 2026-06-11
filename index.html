@@ -656,6 +656,95 @@ function pollBatchStatus() {
   });
 }
 
+// ── Semantic Search ───────────────────────────────────────────────────────────
+
+function runSemanticSearch() {
+  var query = ($('#semanticQuery').value || '').trim();
+  if(!query || query.length < 2) { alert('Enter at least 2 characters.'); return; }
+  var resultsDiv = $('#semanticResults');
+  resultsDiv.innerHTML = '<span class="spinner"></span> Searching...';
+
+  apiPost('/api/semantic_search', {query: query, top_k: 15}, function(err, data) {
+    if(err) {
+      resultsDiv.innerHTML = '<div style="color:var(--red);font-size:12px;">Error: ' + esc(err.message) + '</div>';
+      return;
+    }
+    if(!data.results || data.results.length === 0) {
+      resultsDiv.innerHTML = '<div style="color:var(--text4);font-size:12px;">No results found. Try building embeddings first.</div>';
+      return;
+    }
+    var html = '<div style="font-size:11px;color:var(--text4);margin-bottom:6px;">' + data.count + ' results for "' + esc(data.query) + '"</div>';
+    html += '<div class="paper-list">';
+    data.results.forEach(function(r) {
+      html += '<div class="paper-card" onclick="openReaderById(\'' + esc(r.id) + '\')">';
+      html += '<div class="paper-title">' + esc(r.title) + '</div>';
+      html += '<div class="paper-meta">Score: ' + r.score.toFixed(3) + '</div>';
+      html += '<div class="paper-abs">' + esc(r.summary) + '</div>';
+      html += '</div>';
+    });
+    html += '</div>';
+    resultsDiv.innerHTML = html;
+  });
+}
+
+function buildEmbeddings() {
+  var btn = $('#buildEmbedBtn');
+  btn.disabled = true;
+  btn.textContent = 'Building...';
+  $('#embeddingStatus').textContent = 'Building embeddings in background...';
+
+  apiPost('/api/build_embeddings', {}, function(err, data) {
+    if(err) {
+      btn.disabled = false;
+      btn.textContent = 'Build Embeddings';
+      $('#embeddingStatus').textContent = 'Error: ' + err.message;
+      return;
+    }
+    $('#embeddingStatus').textContent = 'Embeddings building in background. This may take a few minutes.';
+    // Poll for completion
+    var checkInterval = setInterval(function() {
+      apiPost('/api/semantic_search', {query: 'test', top_k: 1}, function(err2, data2) {
+        if(data2 && data2.results !== undefined) {
+          clearInterval(checkInterval);
+          btn.disabled = false;
+          btn.textContent = 'Build Embeddings';
+          $('#embeddingStatus').textContent = 'Embeddings ready!';
+        }
+      });
+    }, 5000);
+  });
+}
+
+// ── Arabic Papers ─────────────────────────────────────────────────────────────
+
+function findArabicPapers() {
+  var minScore = parseInt($('#arabicMinScore').value) || 3;
+  var resultsDiv = $('#arabicResults');
+  resultsDiv.innerHTML = '<span class="spinner"></span> Searching...';
+
+  apiPost('/api/arabic_papers', {min_score: minScore}, function(err, data) {
+    if(err) {
+      resultsDiv.innerHTML = '<div style="color:var(--red);font-size:12px;">Error: ' + esc(err.message) + '</div>';
+      return;
+    }
+    if(!data.results || data.results.length === 0) {
+      resultsDiv.innerHTML = '<div style="color:var(--text4);font-size:12px;">No Arabic/MENA papers found with score >= ' + minScore + '.</div>';
+      return;
+    }
+    var html = '<div style="font-size:11px;color:var(--text4);margin-bottom:6px;">' + data.count + ' papers with MENA relevance (score >= ' + data.min_score + ')</div>';
+    html += '<div class="paper-list">';
+    data.results.forEach(function(r) {
+      html += '<div class="paper-card" onclick="openReaderById(\'' + esc(r.id) + '\')">';
+      html += '<div class="paper-title">' + esc(r.title) + '</div>';
+      html += '<div class="paper-meta">Score: ' + r.score + ' | ' + esc(r.details.join(', ')) + '</div>';
+      html += '<div class="paper-abs">' + esc(r.summary) + '</div>';
+      html += '</div>';
+    });
+    html += '</div>';
+    resultsDiv.innerHTML = html;
+  });
+}
+
 // Export function
 function exportPapers(scope) {
   var fmt = $('#exportFormat').value;
@@ -1372,6 +1461,33 @@ function renderTools(keyInfo) {
   html += '<button class="btn" onclick="exportPapers(\'all\')">Export All</button>';
   html += '<button class="btn btn-sec" onclick="exportPapers(\'search\')">Export Current Search</button>';
   html += '</div>';
+  html += '</div>';
+
+  // ── Semantic Search ───────────────────────────────────────────────────────
+  html += '<div class="tool-section">';
+  html += '<h3>Semantic Search</h3>';
+  html += '<div class="sec-desc" style="margin-bottom:10px;">Search papers by meaning, not just keywords. Uses AI embeddings to find conceptually similar papers.</div>';
+  html += '<div class="tool-row" style="flex-wrap:wrap;gap:6px;">';
+  html += '<input class="sinp" id="semanticQuery" placeholder="e.g. health behaviour change in Saudi women" style="flex:1;min-width:200px;">';
+  html += '<button class="btn" onclick="runSemanticSearch()">Search</button>';
+  html += '</div>';
+  html += '<div id="semanticResults" style="margin-top:8px;"></div>';
+  html += '<div id="embeddingStatus" style="font-size:11px;color:var(--text4);margin-top:4px;"></div>';
+  html += '<div class="tool-row" style="margin-top:6px;">';
+  html += '<button class="btn btn-sec" onclick="buildEmbeddings()" id="buildEmbedBtn">Build Embeddings</button>';
+  html += '</div>';
+  html += '</div>';
+
+  // ── Arabic Papers ─────────────────────────────────────────────────────────
+  html += '<div class="tool-section">';
+  html += '<h3>Arabic / MENA Papers</h3>';
+  html += '<div class="sec-desc" style="margin-bottom:10px;">Find papers with Arabic content or strong MENA relevance. Detects Arabic script and region-specific keywords.</div>';
+  html += '<div class="tool-row">';
+  html += '<label>Min Score</label>';
+  html += '<input type="number" id="arabicMinScore" value="3" min="1" max="20" style="width:64px;">';
+  html += '<button class="btn" onclick="findArabicPapers()">Find Papers</button>';
+  html += '</div>';
+  html += '<div id="arabicResults" style="margin-top:8px;"></div>';
   html += '</div>';
 
   // ── Search History ───────────────────────────────────────────────────────

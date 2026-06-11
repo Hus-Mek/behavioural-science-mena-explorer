@@ -6,14 +6,15 @@ import subprocess
 import threading
 import urllib.request
 import urllib.error
+import urllib.parse
 import csv
 import io
+import time
+import hashlib
 from pathlib import Path
 from datetime import datetime
 from collections import Counter
 from http.server import HTTPServer, SimpleHTTPRequestHandler
-import urllib.parse
-import time
 
 # ── Rate Limiter ─────────────────────────────────────────────────────────────
 class RateLimiter:
@@ -102,6 +103,229 @@ RESULTS_DIR = ROOT / "results"
 
 for d in [RAW_DIR, RESULTS_DIR]:
     d.mkdir(parents=True, exist_ok=True)
+
+# ── PDF Extraction ───────────────────────────────────────────────────────────
+PDF_DIR = ROOT / "data" / "pdfs"
+PDF_DIR.mkdir(parents=True, exist_ok=True)
+
+def extract_pdf_text(pdf_path):
+    """Extract text from a PDF file. Returns plain text or error string."""
+    try:
+        import fitz  # pymupdf
+        doc = fitz.open(pdf_path)
+        text = ""
+        for page in doc:
+            text += page.get_text()
+        doc.close()
+        return text.strip()
+    except ImportError:
+        pass
+    except Exception as e:
+        return f"[PDF extraction error: {e}]"
+
+    try:
+        import pdfplumber
+        text = ""
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                text += (page.extract_text() or "") + "\n"
+        return text.strip()
+    except ImportError:
+        pass
+    except Exception as e:
+        return f"[PDF extraction error: {e}]"
+
+    try:
+        result = subprocess.run(
+            ["pdftotext", "-layout", str(pdf_path), "-"],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    return "[No PDF extraction tool available. Install pymupdf: pip install pymupdf]"
+
+def download_pdf(url, paper_id):
+    """Download a PDF and return the local path."""
+    safe_id = re.sub(r'[^a-zA-Z0-9._-]', '_', str(paper_id))
+    pdf_path = PDF_DIR / f"{safe_id}.pdf"
+    if pdf_path.exists():
+        return pdf_path
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = resp.read()
+            if len(data) < 1000:
+                return None
+            with open(pdf_path, "wb") as f:
+                f.write(data)
+            return pdf_path
+    except Exception as e:
+        print(f"  PDF download failed for {paper_id}: {e}")
+        return None
+
+def get_paper_full_text(paper):
+    """Get full text for a paper: try PDF extraction, fall back to abstract."""
+    paper_id = paper.get("id") or paper.get("entry_id") or ""
+    cache_path = PDF_DIR / f"{paper_id}.txt"
+    if cache_path.exists():
+        try:
+            return cache_path.read_text(encoding="utf-8")
+        except Exception:
+            pass
+    pdf_url = paper.get("pdf_url") or paper.get("url", "")
+    if pdf_url and pdf_url.endswith(".pdf"):
+        pdf_path = download_pdf(pdf_url, paper_id)
+        if pdf_path:
+            text = extract_pdf_text(pdf_path)
+            if text and not text.startswith("["):
+                try:
+                    cache_path.write_text(text, encoding="utf-8")
+                except Exception:
+                    pass
+            return text
+    return paper.get("summary") or ""
+
+
+# ── Semantic Search ───────────────────────────────────────────────────────────
+EMBEDDING_MODEL = "text-embedding-3-small"
+EMBEDDING_CACHE = ROOT / "data" / "embeddings.json"
+_paper_embeddings = None
+_paper_embedding_ids = []
+
+def _load_embeddings():
+    global _paper_embeddings, _paper_embedding_ids
+    if _paper_embeddings is not None:
+        return
+    if EMBEDDING_CACHE.exists():
+        try:
+            cached = json.load(open(EMBEDDING_CACHE))
+            import numpy as np
+            _paper_embeddings = np.array(cached["embeddings"])
+            _paper_embedding_ids = cached["ids"]
+            return
+        except Exception:
+            pass
+    _paper_embeddings = None
+    _paper_embedding_ids = []
+
+def _get_embedding(text):
+    api_key = get_api_key()
+    if not api_key:
+        return None
+    payload = json.dumps({"model": EMBEDDING_MODEL, "input": text[:8000]}).encode()
+    req = urllib.request.Request(
+        f"{LLM_BASE_URL}/embeddings", data=payload,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read())
+            return data["data"][0]["embedding"]
+    except Exception as e:
+        print(f"  Embedding error: {e}")
+        return None
+
+def build_embeddings(papers):
+    import numpy as np
+    _load_embeddings()
+    paper_ids = [p.get("id") or p.get("entry_id") for p in papers]
+    if _paper_embedding_ids == paper_ids and _paper_embeddings is not None:
+        return
+    print("  Building embeddings for semantic search...")
+    embeddings, ids = [], []
+    for i, p in enumerate(papers):
+        text = (p.get("title") or "") + " " + (p.get("summary") or "")
+        emb = _get_embedding(text)
+        if emb:
+            embeddings.append(emb)
+            ids.append(p.get("id") or p.get("entry_id"))
+        if (i + 1) % 10 == 0:
+            print(f"    {i+1}/{len(papers)} embedded")
+    if embeddings:
+        _paper_embeddings = np.array(embeddings)
+        _paper_embedding_ids = ids
+        try:
+            json.dump({"embeddings": _paper_embeddings.tolist(), "ids": ids}, open(EMBEDDING_CACHE, "w"))
+        except Exception:
+            pass
+        print(f"  Embeddings built: {len(ids)} papers")
+
+def semantic_search(query, papers, top_k=15):
+    import numpy as np
+    _load_embeddings()
+    if _paper_embeddings is None or len(_paper_embeddings) == 0:
+        return []
+    query_emb = _get_embedding(query)
+    if query_emb is None:
+        return []
+    query_vec = np.array(query_emb)
+    norms = np.linalg.norm(_paper_embeddings, axis=1)
+    query_norm = np.linalg.norm(query_vec)
+    if query_norm == 0:
+        return []
+    similarities = np.dot(_paper_embeddings, query_vec) / (norms * query_norm)
+    top_indices = np.argsort(similarities)[::-1][:top_k]
+    results = []
+    for idx in top_indices:
+        paper_id = _paper_embedding_ids[idx]
+        paper = next((p for p in papers if (p.get("id") or p.get("entry_id")) == paper_id), None)
+        if paper:
+            results.append({"paper": paper, "score": float(similarities[idx])})
+    return results
+
+
+# ── Arabic Detection ──────────────────────────────────────────────────────────
+ARABIC_PATTERN = re.compile(r'[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]')
+ARABIC_KEYWORDS = [
+    "arabic", "arab", "عرب", "السعودية", "سعودي", "الإمارات", "إماراتي",
+    "قطر", "قطري", "الكويت", "كويتي", "البحرين", "بحريني", "عمان", "عماني",
+    "مصر", "مصري", "الأردن", "أردني", "لبنان", "لبناني", "العراق", "عراقي",
+    "إيران", "إيراني", "فلسطين", "فلسطيني", "غزة", "القدس",
+    "تركيا", "تركي", "اليمن", "يمني", "سوريا", "سوري",
+    "المغرب", "مغربي", "تونس", "تونسي", "الجزائر", "جزائري", "ليبيا", "ليبي",
+    "السودان", "سوداني", "موريتانيا", "موريتاني",
+    "إسلام", "إسلامي", "مسلم", "قرآن", "حديث", "فقه", "شريعة",
+    "عربية", "العربية",
+]
+
+def detect_arabic_content(text):
+    if not text:
+        return False, []
+    has_script = bool(ARABIC_PATTERN.search(text))
+    text_lower = text.lower()
+    found_keywords = [kw for kw in ARABIC_KEYWORDS if kw in text_lower]
+    return has_script or len(found_keywords) > 0, found_keywords
+
+def score_arabic_relevance(paper):
+    title = (paper.get("title") or "").lower()
+    summary = (paper.get("summary") or "").lower()
+    text = title + " " + summary
+    score = 0
+    details = []
+    has_script, script_words = detect_arabic_content(text)
+    if has_script:
+        score += 5
+        details.append("arabic_script")
+    for kw in ARABIC_KEYWORDS:
+        if kw in text:
+            score += 1
+            if kw not in details:
+                details.append(kw)
+    country_terms = {
+        "saudi": 3, "arabia": 3, "uae": 3, "emirati": 3, "qatar": 3, "kuwait": 3,
+        "bahrain": 3, "oman": 3, "egypt": 3, "jordan": 3, "lebanon": 3, "iraq": 3,
+        "iran": 2, "israel": 2, "palestine": 3, "gaza": 3, "turkey": 2, "yemen": 3,
+        "syria": 3, "morocco": 3, "tunisia": 3, "algeria": 3, "libya": 3, "sudan": 3,
+        "mena": 4, "middle east": 4, "gulf": 3, "arabian": 3,
+    }
+    for term, boost in country_terms.items():
+        if term in text:
+            score += boost
+            details.append(term)
+    return score, list(set(details))
 
 BEHAVIOURAL_TERMS = [
     "nudge","nudging","behavior","behaviour","cognitive","decision",
@@ -1027,6 +1251,45 @@ class Handler(SimpleHTTPRequestHandler):
             self._json({"ok": True, "message": "Shutting down..."})
             threading.Timer(0.5, self.server.shutdown).start()
 
+        elif path == "/api/semantic_search":
+            if not self._rate_check():
+                return
+            query = data.get("query", "").strip()
+            if not query or len(query) < 2:
+                self._json({"error": "Query must be at least 2 characters."}, status=400)
+                return
+            top_k = int(data.get("top_k", 15))
+            results = semantic_search(query, papers_global, top_k=top_k)
+            papers_out = [{"id": r["paper"].get("id"), "title": r["paper"].get("title", ""),
+                           "summary": (r["paper"].get("summary") or "")[:300],
+                           "score": round(r["score"], 4)} for r in results]
+            self._json({"query": query, "results": papers_out, "count": len(papers_out)})
+
+        elif path == "/api/arabic_papers":
+            if not self._rate_check():
+                return
+            min_score = int(data.get("min_score", 3))
+            scored = []
+            for p in papers_global:
+                score, details = score_arabic_relevance(p)
+                if score >= min_score:
+                    scored.append({
+                        "id": p.get("id"),
+                        "title": p.get("title", ""),
+                        "summary": (p.get("summary") or "")[:300],
+                        "score": score,
+                        "details": details[:10]
+                    })
+            scored.sort(key=lambda x: -x["score"])
+            self._json({"results": scored, "count": len(scored), "min_score": min_score})
+
+        elif path == "/api/build_embeddings":
+            if not self._rate_check():
+                return
+            thread = threading.Thread(target=build_embeddings, args=(papers_global,), daemon=True)
+            thread.start()
+            self._json({"ok": True, "message": "Building embeddings in background..."})
+
         else:
             self.send_error(404)
 
@@ -1042,6 +1305,8 @@ def serve(port=3000):
         save_analysis(analysis_global)
         s = analysis_global["summary"]
         print(f"  Analysis: {s['total_papers']} papers, {s['unique_authors']} authors, {s['concept_clusters_count']} clusters")
+        # Build embeddings in background for semantic search
+        threading.Thread(target=build_embeddings, args=(papers_global,), daemon=True).start()
     else:
         analysis_global = {"total_papers":0,"summary":{},"yearly_distribution":{},
                            "top_title_keywords":[],"top_abstract_keywords":[],
