@@ -564,6 +564,98 @@ function clearSearchHistory() {
   renderSearchHistory();
 }
 
+// Batch AI Analysis with progress tracking
+var currentBatchJob = null;
+
+function runBatchAnalysis() {
+  var start = parseInt($('#batchStart').value) || 0;
+  var count = parseInt($('#batchCount').value) || 10;
+  var btn = $('#batchBtn');
+  var progressDiv = $('#batchProgress');
+  var progressBar = $('#batchProgressBar');
+  var statusDiv = $('#batchStatus');
+
+  btn.disabled = true;
+  btn.textContent = 'Starting...';
+  progressDiv.style.display = 'block';
+  progressBar.style.width = '0%';
+  statusDiv.textContent = 'Starting batch analysis...';
+
+  fetch('/api/summarise_all', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({start: start, count: count})
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(data) {
+    if(data.error) {
+      btn.disabled = false;
+      btn.textContent = 'Run Analysis';
+      progressDiv.style.display = 'none';
+      alert('Error: ' + data.error);
+      return;
+    }
+    currentBatchJob = data.job_id;
+    btn.textContent = 'Analysing...';
+    statusDiv.textContent = '0 / ' + data.total + ' papers analysed';
+    pollBatchStatus();
+  })
+  .catch(function(e) {
+    btn.disabled = false;
+    btn.textContent = 'Run Analysis';
+    progressDiv.style.display = 'none';
+    alert('Failed to start batch: ' + e.message);
+  });
+}
+
+function pollBatchStatus() {
+  if(!currentBatchJob) return;
+
+  fetch('/api/summarise_all/status', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({job_id: currentBatchJob})
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(data) {
+    var btn = $('#batchBtn');
+    var progressBar = $('#batchProgressBar');
+    var statusDiv = $('#batchStatus');
+
+    if(data.error) {
+      btn.disabled = false;
+      btn.textContent = 'Run Analysis';
+      alert('Error: ' + data.error);
+      currentBatchJob = null;
+      return;
+    }
+
+    var pct = data.total > 0 ? Math.round((data.progress / data.total) * 100) : 0;
+    progressBar.style.width = pct + '%';
+    statusDiv.textContent = data.progress + ' / ' + data.total + ' papers analysed';
+
+    if(data.status === 'done') {
+      btn.disabled = false;
+      btn.textContent = 'Run Analysis';
+      statusDiv.textContent = 'Done! ' + data.total + ' papers analysed.';
+      currentBatchJob = null;
+    } else if(data.status === 'running') {
+      setTimeout(pollBatchStatus, 2000);
+    } else {
+      btn.disabled = false;
+      btn.textContent = 'Run Analysis';
+      statusDiv.textContent = 'Failed: ' + (data.error || 'Unknown error');
+      currentBatchJob = null;
+    }
+  })
+  .catch(function(e) {
+    // Retry on network error
+    if(currentBatchJob) {
+      setTimeout(pollBatchStatus, 3000);
+    }
+  });
+}
+
 // Export function
 function exportPapers(scope) {
   var fmt = $('#exportFormat').value;

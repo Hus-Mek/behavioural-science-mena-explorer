@@ -211,9 +211,41 @@ def load_paper_analysis(paper_id):
     return None
 
 
+# ── Batch Job Tracking ───────────────────────────────────────────────────────
+batch_jobs = {}  # job_id -> {status, progress, total, results, error}
+batch_job_counter = 0
+batch_jobs_lock = threading.Lock()
+
+
+def _run_batch_job(job_id, papers):
+    """Background thread: summarise papers one by one, track progress."""
+    total = len(papers)
+    results = []
+    for i, paper in enumerate(papers):
+        try:
+            result = llm_summarise(paper)
+            results.append({
+                "id": paper.get("id"),
+                "title": paper.get("title"),
+                "analysis": result
+            })
+        except Exception as e:
+            results.append({
+                "id": paper.get("id"),
+                "title": paper.get("title"),
+                "analysis": {"error": str(e)}
+            })
+        with batch_jobs_lock:
+            batch_jobs[job_id]["progress"] = i + 1
+            batch_jobs[job_id]["results"] = results
+    with batch_jobs_lock:
+        batch_jobs[job_id]["status"] = "done"
+        batch_jobs[job_id]["progress"] = total
+
+
 def load_papers():
     """Load and deduplicate papers from all raw files.
-    
+
     Deduplication happens in two passes:
     1. Exact ID-based dedup (primary key = id or entry_id)
     2. Title-based fuzzy dedup (token overlap > 0.85) to catch cross-source dupes
@@ -958,8 +990,38 @@ class Handler(SimpleHTTPRequestHandler):
                             "start": start, "total": len(papers_global)}, status=400)
                 return
             batch = papers_global[start:start+count]
-            results = llm_batch_summarise(batch)
-            self._json({"start": start, "count": len(batch), "total": len(papers_global), "results": results})
+            # Create job
+            global batch_job_counter
+            with batch_jobs_lock:
+                batch_job_counter += 1
+                job_id = f"batch_{batch_job_counter}"
+                batch_jobs[job_id] = {
+                    "status": "running",
+                    "progress": 0,
+                    "total": len(batch),
+                    "results": [],
+                    "error": None
+                }
+            # Start background thread
+            thread = threading.Thread(target=_run_batch_job, args=(job_id, batch), daemon=True)
+            thread.start()
+            self._json({"job_id": job_id, "status": "running", "total": len(batch)})
+
+        elif path == "/api/summarise_all/status":
+            job_id = data.get("job_id", "")
+            with batch_jobs_lock:
+                job = batch_jobs.get(job_id)
+            if not job:
+                self._json({"error": f"Job '{job_id}' not found."}, status=404)
+                return
+            self._json({
+                "job_id": job_id,
+                "status": job["status"],
+                "progress": job["progress"],
+                "total": job["total"],
+                "results": job["results"],
+                "error": job["error"]
+            })
 
         elif path == "/api/shutdown":
             self._json({"ok": True, "message": "Shutting down..."})

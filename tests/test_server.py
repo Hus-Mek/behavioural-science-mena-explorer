@@ -281,5 +281,73 @@ class TestWordFreq:
         assert "efgh" in words
 
 
+# ── Batch Job Tracking ───────────────────────────────────────────────────────
+
+class TestBatchJobs:
+    def test_job_created(self, tmp_path):
+        """Starting a batch job should create a job entry."""
+        papers = [
+            {"id": f"bj{i}", "title": f"Batch Job Test Paper {i}", "summary": f"Abstract {i}"}
+            for i in range(3)
+        ]
+        # papers_global is set at runtime in serve(); patch it into the module
+        server.papers_global = papers
+        try:
+            handler = server.Handler.__new__(server.Handler)
+            handler.filters = []
+            handler._rate_check = lambda: True
+            handler._server = lambda: None
+            handler.client_address = ("127.0.0.1", 0)
+            handler.headers = {"Content-Length": "0"}
+            handler.path = "/api/summarise_all"
+            handler.rfile = None
+            handler.wfile = type("MockFile", (), {"write": lambda self, x: None})()
+            handler.send_response = lambda status: None
+            handler.send_header = lambda *a: None
+            handler.end_headers = lambda: None
+
+            sent = []
+            handler._json = lambda data, status=200: sent.append(data)
+
+            import io
+            body = json.dumps({"start": 0, "count": 3}).encode()
+            handler.headers["Content-Length"] = str(len(body))
+            handler.rfile = io.BytesIO(body)
+
+            server.batch_jobs.clear()
+            server.batch_job_counter = 0
+
+            handler.do_POST()
+
+            assert len(sent) == 1
+            assert "job_id" in sent[0]
+            assert sent[0]["status"] == "running"
+            assert sent[0]["total"] == 3
+        finally:
+            del server.papers_global
+
+    def test_job_tracking(self):
+        """Job should track progress."""
+        with server.batch_jobs_lock:
+            job_id = "test_job_1"
+            server.batch_jobs[job_id] = {
+                "status": "running",
+                "progress": 5,
+                "total": 10,
+                "results": [],
+                "error": None
+            }
+
+        with server.batch_jobs_lock:
+            job = server.batch_jobs[job_id]
+            assert job["status"] == "running"
+            assert job["progress"] == 5
+            assert job["total"] == 10
+
+        # Clean up
+        with server.batch_jobs_lock:
+            del server.batch_jobs[job_id]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
