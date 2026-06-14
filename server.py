@@ -15,7 +15,7 @@ import tempfile
 from pathlib import Path
 from datetime import datetime
 from collections import Counter
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+from http.server import HTTPServer, ThreadingHTTPServer, SimpleHTTPRequestHandler
 
 try:
     from docling.document_converter import DocumentConverter
@@ -921,6 +921,10 @@ scraper_status = {"running": False, "output": "", "returncode": None}
 
 class Handler(SimpleHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    # Drop a connection that opens but never sends a full request (browsers
+    # routinely open speculative/preconnect sockets). Without this a single
+    # blocked socket read would otherwise pin a worker thread indefinitely.
+    timeout = 30
 
     def log_message(self, *a): pass
 
@@ -1458,7 +1462,13 @@ def serve(port=3000):
                            "top_authors":[],"date_range":{"earliest":None,"latest":None},
                            "monthly_distribution":{}}
 
-    server = HTTPServer(("", port), Handler)
+    # ThreadingHTTPServer: each request runs on its own thread so concurrent
+    # browser requests (init / papers / analysis / status polls) and any
+    # long-running call (LLM, scraper, PDF extraction) can never block one
+    # another. Single-threaded HTTPServer froze the whole server whenever one
+    # socket stalled, which surfaced as "Failed to connect to server".
+    server = ThreadingHTTPServer(("", port), Handler)
+    server.daemon_threads = True
     server.allow_reuse_address = True
 
     print(f"\n  Running at http://localhost:{port}")
