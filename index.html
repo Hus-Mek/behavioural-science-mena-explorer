@@ -1249,6 +1249,25 @@ function shutdownServer(){
   $('#serverStatusTool').innerHTML = '<span class="status-badge warn">Shutting down…</span>';
   apiGet('/api/shutdown', ()=>{ $('#serverStatusTool').innerHTML = '<span class="status-badge err">Stopped — close this tab</span>'; setSrv(false); });
 }
+function fetchLogs(){
+  const el = $('#logsDisplay'), status = $('#logsStatus');
+  el.style.display = 'block';
+  status.textContent = 'Loading…';
+  apiGet('/api/logs', (err, data)=>{
+    if(err){ status.textContent = 'Error: '+err.message; return; }
+    const logs = data.scraper_logs || [];
+    if(!logs.length){ el.textContent = '(no logs yet)'; status.textContent = 'No logs'; return; }
+    el.textContent = logs.join('\n');
+    el.scrollTop = el.scrollHeight;
+    status.textContent = logs.length+' entries';
+  });
+}
+function clearLogs(){
+  if(window.scraper_logs) window.scraper_logs.length = 0;
+  $('#logsDisplay').textContent = '';
+  $('#logsStatus').textContent = 'Cleared';
+  toast('Logs cleared','info');
+}
 function renderTools(keyInfo){
   let h = '';
   h += '<div class="tool-section"><h3>'+svg('<rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',2)+'LLM Configuration</h3>'
@@ -1295,6 +1314,10 @@ function renderTools(keyInfo){
   h += '<div class="tool-section"><h3>'+svg('<rect x="2" y="4" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="6" rx="2"/><path d="M6 8h.01M6 17h.01"/>',2)+'Server</h3>'
     + '<div class="tool-row"><button class="btn btn-sec" onclick="checkServerStatus()">Check Status</button><button class="btn btn-danger" onclick="shutdownServer()">Shutdown</button><span id="serverStatusTool" style="font-size:11.5px;"></span></div>'
     + '<div style="margin-top:10px;"><button class="btn btn-ghost btn-sm" onclick="toggleShortcutModal()">⌨  Keyboard shortcuts</button></div></div>';
+
+  h += '<div class="tool-section"><h3>'+svg('<path d="M4 4h16a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z"/><path d="M8 8h8M8 12h8M8 16h5"/>',2)+'Server Logs</h3>'
+    + '<div class="tool-row"><button class="btn btn-sec" onclick="fetchLogs()">Refresh Logs</button><button class="btn btn-ghost btn-sm" onclick="clearLogs()">Clear</button><span id="logsStatus" style="font-size:11.5px;color:var(--text-4);margin-left:auto;"></span></div>'
+    + '<div id="logsDisplay" class="log" style="display:none;margin-top:11px;max-height:300px;"></div></div>';
 
   $('#tools-content').innerHTML = h;
   renderQueryTags(); syncPresetButtons(); renderSearchHistory();

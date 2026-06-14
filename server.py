@@ -12,6 +12,8 @@ import io
 import time
 import hashlib
 import tempfile
+import logging
+import queue
 from pathlib import Path
 from datetime import datetime
 from collections import Counter
@@ -64,6 +66,32 @@ rate_limiter = RateLimiter(max_requests=10, window_seconds=60)
 
 ROOT = Path(__file__).parent.resolve()
 CONFIG_FILE = ROOT / "config.json"
+
+LOG_DIR = ROOT / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE = LOG_DIR / "server.log"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+scraper_log_queue = queue.Queue()
+scraper_logs = []
+
+def log_scraper(msg):
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    entry = f"[{timestamp}] {msg}"
+    scraper_logs.append(entry)
+    logger.info(f"SCRAPER: {msg}")
+
+def get_scraper_logs():
+    return scraper_logs
 
 def load_config():
     if CONFIG_FILE.exists():
@@ -564,6 +592,68 @@ def load_papers():
         print(f"  Title dedup removed {removed} near-duplicate papers")
     return deduped
 
+
+def load_latest_scrape():
+    """Load and deduplicate papers from the most recent scrape file."""
+    files = list(RAW_DIR.glob("papers_*.json"))
+    if not files:
+        return None, None, None
+    
+    latest_file = max(files, key=lambda f: f.stat().st_mtime)
+    try:
+        with open(latest_file, "r", encoding="utf-8", errors="replace") as fp:
+            data = json.load(fp)
+            if not isinstance(data, list):
+                return None, None, None
+            papers = data
+    except Exception as e:
+        print(f"Warning: Could not load {latest_file}: {e}")
+        return None, None, None
+
+    seen_ids = set()
+    unique = []
+    for p in papers:
+        pid = p.get("id") or p.get("entry_id")
+        if pid and pid in seen_ids:
+            continue
+        if pid:
+            seen_ids.add(pid)
+        unique.append(p)
+
+    def _norm_title(t):
+        if not t:
+            return frozenset()
+        return frozenset(re.sub(r'[^a-z0-9 ]', '', t.lower()).strip().split())
+
+    deduped = []
+    deduped_tokens = []
+    for p in unique:
+        title = p.get("title", "")
+        tokens = _norm_title(title)
+        if not tokens:
+            deduped.append(p)
+            deduped_tokens.append(tokens)
+            continue
+        is_dup = False
+        for existing_tokens in deduped_tokens:
+            if not existing_tokens:
+                continue
+            overlap = tokens & existing_tokens
+            min_len = min(len(tokens), len(existing_tokens))
+            if min_len > 0 and len(overlap) / min_len > 0.85:
+                is_dup = True
+                break
+        if not is_dup:
+            deduped.append(p)
+            deduped_tokens.append(tokens)
+
+    removed = len(unique) - len(deduped)
+    if removed > 0:
+        print(f"  Title dedup removed {removed} near-duplicate papers from latest scrape")
+    
+    timestamp = datetime.fromtimestamp(latest_file.stat().st_mtime).isoformat()
+    return deduped, latest_file.name, timestamp
+
 def word_freq(texts, stopwords=None, min_len=3):
     if stopwords is None:
         stopwords = {"the","and","for","are","but","not","you","all","any","can","had",
@@ -892,29 +982,75 @@ def search_papers(papers, query, fields=None):
                 break
     return results
 
+BEHAVIOURAL_QUERY_PREFIX = "behaviour OR behavior OR cognitive OR decision OR bias OR motivation OR incentive OR nudge OR habit OR \"social norm\" OR intervention OR policy OR framing OR heuristic OR \"self-control\" OR willpower OR attention OR salience OR \"opt-in\" OR \"opt-out\" OR commitment OR consistency OR reciprocity OR authority OR scarcity OR \"social proof\""
+
+def _ensure_behavioural_query(query_key):
+    if query_key in SCRAPER_QUERIES:
+        return query_key
+    return f"({BEHAVIOURAL_QUERY_PREFIX}) AND ({query_key})"
+
 def run_scraper(query_key, count):
     global scraper_status, papers_global, analysis_global
+    behavioural_query = _ensure_behavioural_query(query_key)
     scraper_status["running"] = True
-    scraper_status["output"] = f"Starting scrape: {query_key} ({count} papers)...\n"
+    scraper_status["output"] = f"Starting scrape: {query_key} -> {behavioural_query[:100]}... ({count} papers)\n"
     scraper_status["returncode"] = None
+    log_scraper(f"Starting scrape: {query_key} ({count} papers)")
+    log_scraper(f"Behavioural query: {behavioural_query}")
     try:
-        result = subprocess.run(
-            [sys.executable, "scraper.py", "-q", query_key, "-n", str(count)],
-            capture_output=True, text=True, timeout=300, cwd=str(ROOT)
+        proc = subprocess.Popen(
+            [sys.executable, "scraper.py", "-q", behavioural_query, "-n", str(count)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            cwd=str(ROOT),
+            bufsize=1,
         )
-        scraper_status["output"] += result.stdout + "\n" + result.stderr
-        scraper_status["returncode"] = result.returncode
-        if result.returncode == 0:
+        output_lines = []
+        start_time = time.time()
+        timeout = 300
+        while True:
+            if proc.poll() is not None:
+                break
+            if time.time() - start_time > timeout:
+                proc.kill()
+                log_scraper("Scraper timed out after 5 minutes")
+                scraper_status["output"] += "\nScraper timed out after 5 minutes."
+                scraper_status["returncode"] = -1
+                scraper_status["running"] = False
+                return
+            line = proc.stdout.readline()
+            if line:
+                line = line.rstrip()
+                output_lines.append(line)
+                scraper_status["output"] += line + "\n"
+                log_scraper(line)
+            else:
+                time.sleep(0.1)
+        for line in proc.stdout:
+            line = line.rstrip()
+            output_lines.append(line)
+            scraper_status["output"] += line + "\n"
+            log_scraper(line)
+        returncode = proc.wait()
+        scraper_status["returncode"] = returncode
+        if returncode == 0:
+            log_scraper("Scraper completed successfully, reloading papers...")
             papers_global = load_papers()
             analysis_global = analyze_papers(papers_global)
             save_analysis(analysis_global)
-            scraper_status["output"] += f"\nDone. Total papers: {len(papers_global)}"
-    except subprocess.TimeoutExpired:
-        scraper_status["output"] += "\nScraper timed out after 5 minutes."
-        scraper_status["returncode"] = -1
+            msg = f"\nDone. Total papers: {len(papers_global)}"
+            scraper_status["output"] += msg
+            log_scraper(msg.strip())
+        else:
+            err_msg = f"\nScraper failed with return code {returncode}"
+            scraper_status["output"] += err_msg
+            log_scraper(err_msg.strip())
     except Exception as e:
-        scraper_status["output"] += f"\nError: {e}"
+        err_msg = f"\nError: {e}"
+        scraper_status["output"] += err_msg
         scraper_status["returncode"] = -1
+        log_scraper(f"Error: {e}")
     scraper_status["running"] = False
 
 scraper_status = {"running": False, "output": "", "returncode": None}
@@ -958,8 +1094,21 @@ class Handler(SimpleHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         params = urllib.parse.parse_qs(parsed.query)
-
+        logger.info(f"GET {path} from {self.client_address[0]}")
         try:
+            if path == "/api/latest_scrape":
+                papers, source_file, timestamp = load_latest_scrape()
+                if papers is None:
+                    self._json({"papers": [], "count": 0, "error": "No scrape files found"})
+                    return
+                self._json({
+                    "papers": papers,
+                    "source_file": source_file,
+                    "count": len(papers),
+                    "timestamp": timestamp
+                })
+                return
+
             if path == "/api/init":
                 papers_meta = []
                 for p in papers_global:
@@ -1023,6 +1172,13 @@ class Handler(SimpleHTTPRequestHandler):
                     "running": scraper_status.get("running", False),
                     "output": scraper_status.get("output", ""),
                     "returncode": scraper_status.get("returncode")
+                })
+                return
+
+            elif path == "/api/logs":
+                self._json({
+                    "scraper_logs": get_scraper_logs(),
+                    "server_log_path": str(LOG_FILE)
                 })
                 return
 
@@ -1174,7 +1330,7 @@ class Handler(SimpleHTTPRequestHandler):
             data = json.loads(body) if body else {}
         except Exception:
             data = {}
-
+        logger.info(f"POST {path} from {self.client_address[0]}")
         try:
             if path == "/api/config/key":
                 key = data.get("key", "").strip()
@@ -1197,6 +1353,28 @@ class Handler(SimpleHTTPRequestHandler):
                     t.start()
                 self._json({"ok": True, "message": f"Started scraper for {len(queries)} query group(s) ({max_count} papers each)."})
 
+            elif path == "/api/papers_by_ids":
+                ids = data.get("ids", [])
+                if not isinstance(ids, list):
+                    self._json({"error": "'ids' must be a list"}, status=400)
+                    return
+                id_set = set(str(i) for i in ids)
+                found = []
+                missing = []
+                for pid in id_set:
+                    paper = next((p for p in papers_global if str(p.get("id") or p.get("entry_id") or "") == pid), None)
+                    if paper:
+                        found.append(paper)
+                    else:
+                        missing.append(pid)
+                self._json({
+                    "papers": found,
+                    "count": len(found),
+                    "found": len(found),
+                    "missing": missing
+                })
+                return
+
             elif path == "/api/chat":
                 if not self._rate_check():
                     return
@@ -1206,9 +1384,28 @@ class Handler(SimpleHTTPRequestHandler):
                     return
                 history = data.get("history", [])
                 paper_ids = data.get("paper_ids", [])
-                if paper_ids:
-                    papers = [p for p in papers_global if p.get("id") in paper_ids]
-                else:
+                source = data.get("source", "all")
+                warning = None
+
+                if source == "latest":
+                    latest_papers, source_file, timestamp = load_latest_scrape()
+                    if latest_papers is None:
+                        warning = "No latest scrape file found, falling back to all papers"
+                        source = "all"
+                    else:
+                        papers = latest_papers[:30]
+                        if paper_ids:
+                            id_set = set(str(i) for i in paper_ids)
+                            papers = [p for p in papers if str(p.get("id") or p.get("entry_id") or "") in id_set]
+
+                if source == "bookmarks" or source == "selected":
+                    if paper_ids:
+                        id_set = set(str(i) for i in paper_ids)
+                        papers = [p for p in papers_global if str(p.get("id") or p.get("entry_id") or "") in id_set]
+                    else:
+                        papers = []
+
+                if source == "all":
                     import re as _re
                     query_lower = query.lower()
                     query_phrases = [query_lower]
@@ -1225,6 +1422,7 @@ class Handler(SimpleHTTPRequestHandler):
                     papers = [p for _, p in scored[:30]]
                     if not papers:
                         papers = papers_global[:30]
+
                 result = llm_rag_chat(query, papers, history=history)
                 if "content" in result and result["content"]:
                     import re as _rev
@@ -1234,7 +1432,10 @@ class Handler(SimpleHTTPRequestHandler):
                     if invalid:
                         result["content"] += "\n\n[Warning: citations " + ", ".join(invalid) + " refer to papers not in the context. They may be hallucinated.]"
                 papers_meta = [{"id": p.get("id"), "title": p.get("title", "")} for p in papers[:30]]
-                self._json({"query": query, "papers_used": papers_meta, "response": result})
+                response_data = {"query": query, "papers_used": papers_meta, "response": result}
+                if warning:
+                    response_data["warning"] = warning
+                self._json(response_data)
 
             elif path == "/api/summarise":
                 if not self._rate_check():
