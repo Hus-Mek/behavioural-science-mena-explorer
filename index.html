@@ -147,6 +147,7 @@ body{
 .pcard .ptitle{font-size:13px;font-weight:500;line-height:1.4;margin-bottom:3px;color:var(--text);letter-spacing:-.01em;}
 .pcard .pauth{font-size:11px;color:var(--text4);margin-bottom:3px;}
 .pcard .pabs{font-size:12px;color:var(--text3);line-height:1.5;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;}
+.pcard .pmeta{font-size:10px;color:var(--text4);margin-top:5px;display:flex;gap:8px;flex-wrap:wrap;font-family:var(--mono);}
 .pcard:focus{outline:2px solid var(--accent);outline-offset:2px;}
 .pcard .badge{display:inline;padding:1px 5px;border-radius:4px;font-size:9px;font-weight:500;}
 .pcard .ba{background:oklch(1 0 0 / 0.05);color:var(--text2);}
@@ -385,10 +386,11 @@ body{
   <nav class="hdr">
     <div class="hdr-in">
       <div class="hdr-brand"><div class="logo">B</div>Behavioural Science MENA</div>
-      <div class="hdr-nav" id="mainNav" role="tablist">
+<div class="hdr-nav" id="mainNav" role="tablist">
       <button class="on" data-t="dashboard">Dashboard</button>
       <button data-t="papers">Papers</button>
       <button data-t="concepts">Concepts</button>
+      <button data-t="graph">Graph</button>
       <button data-t="chat">Chat</button>
       <button data-t="bookmarks">&#9733; Bookmarks</button>
       <button data-t="tools">Tools</button>
@@ -415,22 +417,33 @@ body{
     <div class="pag" id="pPag"></div>
   </div>
 
-  <!-- CONCEPTS -->
-  <div class="tab" id="t-concepts">
-    <div class="sec">
-      <div class="sec-title">AI Concept Clustering</div>
-      <div class="sec-desc">Cluster papers by behavioural themes using AI analysis. This replaces keyword-based concept mapping with LLM-powered semantic clustering.</div>
-      <div class="tool-row" style="margin-bottom:12px;">
-        <button class="btn" id="clusterBtn" onclick="runClustering()">Run AI Clustering</button>
-        <label style="font-size:11px;color:var(--text4);margin-left:8px;">Papers:</label>
-        <input type="number" id="clusterMax" value="50" min="10" max="200" style="width:64px;">
-        <span id="clusterStatus" style="font-size:11px;color:var(--text4);"></span>
-      </div>
-      <div id="conceptsList"></div>
-    </div>
-  </div>
+<!-- CONCEPTS -->
+   <div class="tab" id="t-concepts">
+     <div class="sec">
+       <div class="sec-title">AI Concept Clustering</div>
+       <div class="sec-desc">Cluster papers by behavioural themes using AI analysis. This replaces keyword-based concept mapping with LLM-powered semantic clustering.</div>
+       <div class="tool-row" style="margin-bottom:12px;">
+         <button class="btn" id="clusterBtn" onclick="runClustering()">Run AI Clustering</button>
+         <label style="font-size:11px;color:var(--text4);margin-left:8px;">Papers:</label>
+         <input type="number" id="clusterMax" value="50" min="10" max="200" style="width:64px;">
+         <span id="clusterStatus" style="font-size:11px;color:var(--text4);"></span>
+       </div>
+       <div id="conceptsList"></div>
+     </div>
+   </div>
 
-  <!-- CHAT -->
+   <!-- GRAPH -->
+   <div class="tab" id="t-graph">
+     <div class="sec">
+       <div class="sec-title">Paper Knowledge Graph</div>
+       <div class="sec-desc">Interactive visualization of paper connections based on shared concepts and authors. Node color indicates community clusters.</div>
+       <div id="graphContainer" style="height:80vh;background:var(--surface);border-radius:8px;border:1px solid var(--border-sub);overflow:hidden;">
+         <iframe src="/paper_graph.html" style="width:100%;height:100%;border:none;"></iframe>
+       </div>
+     </div>
+   </div>
+
+   <!-- CHAT -->
   <div class="tab" id="t-chat">
     <div class="sec">
       <div class="sec-title">Research Chat</div>
@@ -468,6 +481,7 @@ body{
     <div class="sc-row"><span>g then d</span><span class="sc-key">g d</span><span>Go to Dashboard</span></div>
     <div class="sc-row"><span>g then p</span><span class="sc-key">g p</span><span>Go to Papers</span></div>
     <div class="sc-row"><span>g then c</span><span class="sc-key">g c</span><span>Go to Concepts</span></div>
+    <div class="sc-row"><span>g then g</span><span class="sc-key">g g</span><span>Go to Graph</span></div>
     <div class="sc-row"><span>g then t</span><span class="sc-key">g t</span><span>Go to Chat</span></div>
     <div class="sc-row"><span>g then b</span><span class="sc-key">g b</span><span>Go to Bookmarks</span></div>
     <div class="sc-row"><span>g then o</span><span class="sc-key">g o</span><span>Go to Tools</span></div>
@@ -493,16 +507,16 @@ body{
 
 <script>
 // STATE
-var PAPERS = [];
-var ANALYSIS = {};
-var curPage = 1;
-var curFiltered = [];
-var CON_PAGE = 20;
-var readerList = [];
-var readerIdx = 0;
-var clusters = null;
-var chatHistory = [];
-var selectedPaperIndex = -1;
+let PAPERS = [];
+let ANALYSIS = {};
+let curPage = 1;
+let curFiltered = [];
+let CON_PAGE = 20;
+let readerList = [];
+let readerIdx = 0;
+let clusters = null;
+let chatHistory = [];
+let selectedPaperIndex = -1;
 
 // Bookmarks - localStorage
 function getBookmarks() {
@@ -517,9 +531,9 @@ function isBookmarked(pid) {
   return getBookmarks().indexOf(String(pid)) !== -1;
 }
 function toggleBookmark(pid) {
-  var bm = getBookmarks();
-  var id = String(pid);
-  var idx = bm.indexOf(id);
+  let bm = getBookmarks();
+  let id = String(pid);
+  let idx = bm.indexOf(id);
   if(idx !== -1) { bm.splice(idx, 1); }
   else { bm.push(id); }
   saveBookmarks(bm);
@@ -527,22 +541,22 @@ function toggleBookmark(pid) {
   renderBookmarks();
 }
 function renderBookmarks() {
-  var el = document.getElementById('bookmarks-list');
+  let el = document.getElementById('bookmarks-list');
   if(!el) return;
-  var bm = getBookmarks();
+  let bm = getBookmarks();
   if(bm.length === 0) {
     el.innerHTML = '<div class="bookmark-empty">No bookmarks yet.<br>Click the &#9733; star on any paper to save it here.</div>';
     return;
   }
-  var html = '';
-  for(var i = 0; i < bm.length; i++) {
-    var pid = bm[i];
-    var p = null;
-    for(var j = 0; j < PAPERS.length; j++) {
+  let html = '';
+  for(let i = 0; i < bm.length; i++) {
+    let pid = bm[i];
+    let p = null;
+    for(let j = 0; j < PAPERS.length; j++) {
       if(String(PAPERS[j].id) === String(pid)) { p = PAPERS[j]; break; }
     }
     if(!p) continue;
-    var pub = (p.published || '').substring(0,10);
+    let pub = (p.published || '').substring(0,10);
     html += '<div class="bookmark-item">';
     html += '<div class="bm-title" onclick="openReaderById(\'' + esc(p.id) + '\')" style="cursor:pointer;">' + esc(p.title) + '</div>';
     html += '<div class="bm-meta">' + esc(pub) + '</div>';
@@ -558,32 +572,27 @@ function getSearchHistory() {
     return JSON.parse(localStorage.getItem('bs_mena_search_history') || '[]');
   } catch(e) { return []; }
 }
-function saveSearchHistory() {
-  var hist = getSearchHistory();
-  localStorage.setItem('bs_mena_search_history', JSON.stringify(hist));
-}
 function addSearchQuery(q) {
   if(!q || q.length < 2) return;
-  var hist = getSearchHistory();
-  // Remove duplicates
+  let hist = getSearchHistory();
   hist = hist.filter(function(h) { return h.query !== q; });
   hist.unshift({query: q, timestamp: Date.now()});
   if(hist.length > 50) hist = hist.slice(0, 50);
   localStorage.setItem('bs_mena_search_history', JSON.stringify(hist));
 }
 function renderSearchHistory() {
-  var el = document.getElementById('searchHistoryList');
+  let el = document.getElementById('searchHistoryList');
   if(!el) return;
-  var hist = getSearchHistory();
+  let hist = getSearchHistory();
   if(hist.length === 0) {
     el.innerHTML = '<p style="font-size:12px;color:var(--text4);padding:8px 0;">No recent searches.</p>';
     return;
   }
-  var html = '';
-  for(var i = 0; i < hist.length; i++) {
-    var h = hist[i];
-    var when = new Date(h.timestamp);
-    var ts = when.toLocaleDateString() + ' ' + when.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+  let html = '';
+  for(let i = 0; i < hist.length; i++) {
+    let h = hist[i];
+    let when = new Date(h.timestamp);
+    let ts = when.toLocaleDateString() + ' ' + when.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
     html += '<div style="display:flex;align-items:center;gap:8px;padding:4px 0;font-size:12px;">';
     html += '<span style="flex:1;cursor:pointer;color:var(--text2);" onclick="document.getElementById(\'pSearch\').value=\'' + esc(h.query) + '\';doPSearch();">' + esc(h.query) + '</span>';
     html += '<span style="color:var(--text4);font-size:10px;font-family:var(--mono);">' + ts + '</span>';
@@ -598,15 +607,15 @@ function clearSearchHistory() {
 }
 
 // Batch AI Analysis with progress tracking
-var currentBatchJob = null;
+let currentBatchJob = null;
 
 function runBatchAnalysis() {
-  var start = parseInt($('#batchStart').value) || 0;
-  var count = parseInt($('#batchCount').value) || 10;
-  var btn = $('#batchBtn');
-  var progressDiv = $('#batchProgress');
-  var progressBar = $('#batchProgressBar');
-  var statusDiv = $('#batchStatus');
+  let start = parseInt($('#batchStart').value) || 0;
+  let count = parseInt($('#batchCount').value) || 10;
+  let btn = $('#batchBtn');
+  let progressDiv = $('#batchProgress');
+  let progressBar = $('#batchProgressBar');
+  let statusDiv = $('#batchStatus');
 
   btn.disabled = true;
   btn.textContent = 'Starting...';
@@ -651,9 +660,9 @@ function pollBatchStatus() {
   })
   .then(function(r) { return r.json(); })
   .then(function(data) {
-    var btn = $('#batchBtn');
-    var progressBar = $('#batchProgressBar');
-    var statusDiv = $('#batchStatus');
+    let btn = $('#batchBtn');
+    let progressBar = $('#batchProgressBar');
+    let statusDiv = $('#batchStatus');
 
     if(data.error) {
       btn.disabled = false;
@@ -663,7 +672,7 @@ function pollBatchStatus() {
       return;
     }
 
-    var pct = data.total > 0 ? Math.round((data.progress / data.total) * 100) : 0;
+    let pct = data.total > 0 ? Math.round((data.progress / data.total) * 100) : 0;
     progressBar.style.width = pct + '%';
     statusDiv.textContent = data.progress + ' / ' + data.total + ' papers analysed';
 
@@ -682,7 +691,6 @@ function pollBatchStatus() {
     }
   })
   .catch(function(e) {
-    // Retry on network error
     if(currentBatchJob) {
       setTimeout(pollBatchStatus, 3000);
     }
@@ -692,9 +700,9 @@ function pollBatchStatus() {
 // ── Semantic Search ───────────────────────────────────────────────────────────
 
 function runSemanticSearch() {
-  var query = ($('#semanticQuery').value || '').trim();
+  let query = ($('#semanticQuery').value || '').trim();
   if(!query || query.length < 2) { alert('Enter at least 2 characters.'); return; }
-  var resultsDiv = $('#semanticResults');
+  let resultsDiv = $('#semanticResults');
   resultsDiv.innerHTML = '<span class="spinner"></span> Searching...';
 
   apiPost('/api/semantic_search', {query: query, top_k: 15}, function(err, data) {
@@ -706,7 +714,7 @@ function runSemanticSearch() {
       resultsDiv.innerHTML = '<div style="color:var(--text4);font-size:12px;">No results found. Try building embeddings first.</div>';
       return;
     }
-    var html = '<div style="font-size:11px;color:var(--text4);margin-bottom:6px;">' + data.count + ' results for "' + esc(data.query) + '"</div>';
+    let html = '<div style="font-size:11px;color:var(--text4);margin-bottom:6px;">' + data.count + ' results for "' + esc(data.query) + '"</div>';
     html += '<div class="paper-list">';
     data.results.forEach(function(r) {
       html += '<div class="paper-card" onclick="openReaderById(\'' + esc(r.id) + '\')">';
@@ -721,7 +729,7 @@ function runSemanticSearch() {
 }
 
 function buildEmbeddings() {
-  var btn = $('#buildEmbedBtn');
+  let btn = $('#buildEmbedBtn');
   btn.disabled = true;
   btn.textContent = 'Building...';
   $('#embeddingStatus').textContent = 'Building embeddings in background...';
@@ -734,8 +742,7 @@ function buildEmbeddings() {
       return;
     }
     $('#embeddingStatus').textContent = 'Embeddings building in background. This may take a few minutes.';
-    // Poll for completion
-    var checkInterval = setInterval(function() {
+    let checkInterval = setInterval(function() {
       apiPost('/api/semantic_search', {query: 'test', top_k: 1}, function(err2, data2) {
         if(data2 && data2.results !== undefined) {
           clearInterval(checkInterval);
@@ -751,8 +758,8 @@ function buildEmbeddings() {
 // ── Arabic Papers ─────────────────────────────────────────────────────────────
 
 function findArabicPapers() {
-  var minScore = parseInt($('#arabicMinScore').value) || 3;
-  var resultsDiv = $('#arabicResults');
+  let minScore = parseInt($('#arabicMinScore').value) || 3;
+  let resultsDiv = $('#arabicResults');
   resultsDiv.innerHTML = '<span class="spinner"></span> Searching...';
 
   apiPost('/api/arabic_papers', {min_score: minScore}, function(err, data) {
@@ -764,7 +771,7 @@ function findArabicPapers() {
       resultsDiv.innerHTML = '<div style="color:var(--text4);font-size:12px;">No Arabic/MENA papers found with score >= ' + minScore + '.</div>';
       return;
     }
-    var html = '<div style="font-size:11px;color:var(--text4);margin-bottom:6px;">' + data.count + ' papers with MENA relevance (score >= ' + data.min_score + ')</div>';
+    let html = '<div style="font-size:11px;color:var(--text4);margin-bottom:6px;">' + data.count + ' papers with MENA relevance (score >= ' + data.min_score + ')</div>';
     html += '<div class="paper-list">';
     data.results.forEach(function(r) {
       html += '<div class="paper-card" onclick="openReaderById(\'' + esc(r.id) + '\')">';
@@ -778,30 +785,35 @@ function findArabicPapers() {
   });
 }
 
-// Export function
+// EXPORT (single implementation — kept from the later version with success banner)
 function exportPapers(scope) {
-  var fmt = $('#exportFormat').value;
-  var q = '';
+  let fmt = $('#exportFormat').value;
+  let q = '';
   if(scope === 'search') {
     q = $('#pSearch').value;
     if(!q || q.length < 2) { alert('Enter at least 2 characters to search, or choose "All Papers".'); return; }
   }
-  var url = '/api/export?format=' + fmt;
+  let url = '/api/export?format=' + fmt;
   if(q) url += '&q=' + encodeURIComponent(q);
-  // Fetch and download
   fetch(url).then(function(resp) {
     if(!resp.ok) { return resp.json().then(function(d) { throw new Error(d.error || 'Export failed'); }); }
-    var cd = resp.headers.get('Content-Disposition');
-    var fname = 'export';
-    if(cd) { var m = cd.match(/filename="([^"]+)"/); if(m) fname = m[1]; }
+    let cd = resp.headers.get('Content-Disposition');
+    let fname = 'export';
+    if(cd) { let m = cd.match(/filename="([^"]+)"/); if(m) fname = m[1]; }
     return resp.blob().then(function(blob) {
-      var a = document.createElement('a');
+      let a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
       a.download = fname;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(a.href);
+      let banner = $('#exportBanner');
+      if(banner) {
+        banner.style.display = 'block';
+        banner.textContent = '\u2713 Exported ' + (scope === 'search' ? 'search results' : 'all papers') + ' as ' + fmt.toUpperCase();
+        setTimeout(function() { banner.style.display = 'none'; }, 3000);
+      }
     });
   }).catch(function(err) {
     alert('Export error: ' + err.message);
@@ -809,31 +821,33 @@ function exportPapers(scope) {
 }
 
 function showSpinner(id) {
-  var el = document.getElementById(id);
+  let el = document.getElementById(id);
   if(el) el.innerHTML = '<span class="spinner"></span> Processing...';
 }
 
 // HELPERS
-var $ = function(s){ return document.querySelector(s); };
-var esc = function(s){
-  var d = document.createElement('div');
+const $ = function(s){ return document.querySelector(s); };
+const esc = function(s){
+  let d = document.createElement('div');
   d.textContent = s || '';
   return d.innerHTML;
 };
-var escH = function(s, q){
+const escH = function(s, q){
   if(!q || !s) return s || '';
   try {
     return s.replace(
-      new RegExp('(' + q.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&') + ')', 'gi'),
+      new RegExp('(' + q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'gi'),
       '<mark style="background:oklch(0.55 0.15 260 / 0.25);color:oklch(0.7 0 260);padding:0 1px;border-radius:2px;">$1</mark>'
     );
   } catch(e) { return s; }
 };
 
 // API CALLS
-var apiGet = function(url, cb) {
-  var xhr = new XMLHttpRequest();
+const apiGet = function(url, cb) {
+  let xhr = new XMLHttpRequest();
   xhr.open('GET', url, true);
+  xhr.timeout = 15000;
+  xhr.ontimeout = function() { cb(new Error('Request timed out'), null); };
   xhr.onreadystatechange = function() {
     if(xhr.readyState === 4) {
       if(xhr.status >= 200 && xhr.status < 300) {
@@ -847,10 +861,12 @@ var apiGet = function(url, cb) {
   xhr.send();
 };
 
-var apiPost = function(url, data, cb) {
-  var xhr = new XMLHttpRequest();
+const apiPost = function(url, data, cb) {
+  let xhr = new XMLHttpRequest();
   xhr.open('POST', url, true);
   xhr.setRequestHeader('Content-Type', 'application/json');
+  xhr.timeout = 15000;
+  xhr.ontimeout = function() { cb(new Error('Request timed out'), null); };
   xhr.onreadystatechange = function() {
     if(xhr.readyState === 4) {
       if(xhr.status >= 200 && xhr.status < 300) {
@@ -864,73 +880,17 @@ var apiPost = function(url, data, cb) {
   xhr.send(JSON.stringify(data));
 };
 
-// INIT
-var init = function() {
-  Promise.all([
-    new Promise(function(resolve, reject) {
-      apiGet('/api/papers?q=', function(err, data) { if(err) reject(err); else resolve(data); });
-    }),
-    new Promise(function(resolve, reject) {
-      apiGet('/api/analysis', function(err, data) { if(err) reject(err); else resolve(data); });
-    }),
-    new Promise(function(resolve, reject) {
-      apiGet('/api/config/key', function(err, data) { if(err) reject(err); else resolve(data); });
-    })
-  ]).then(function(results) {
-    PAPERS = results[0].papers || [];
-    ANALYSIS = results[1] || {};
-    var keyInfo = results[2] || {};
-    curFiltered = PAPERS.slice();
-    selectedPaperIndex = 0;
-    console.log('Loaded', PAPERS.length, 'papers');
-    renderDashboard();
-    renderPapers();
-    renderTools(keyInfo);
-    renderChatStatus(keyInfo);
-    renderBookmarks();
-    renderSearchHistory();
-    initFilters();
-    document.getElementById('loading-overlay').classList.add('hidden');
-  }).catch(function(err) {
-    document.getElementById('loading-overlay').classList.add('hidden');
-    console.error('Init error:', err);
-    document.body.innerHTML = '<div style="padding:60px;text-align:center;color:var(--text3);font-size:13px">Failed to load data.<br>Run <code style="background:var(--surface);padding:2px 6px;border-radius:4px">python server.py</code> first.<br><br><span style="color:var(--text4);font-size:11px">' + esc(err.message) + '</span></div>';
-  });
-};
-init();
-
-// Shutdown server when tab closes
-window.addEventListener('beforeunload', function() {
-  navigator.sendBeacon('/api/shutdown');
-});
-
-// Tab navigation
-var navButtons = document.querySelectorAll('#mainNav button');
-for(var i = 0; i < navButtons.length; i++) {
-  navButtons[i].addEventListener('click', function() {
-    for(var j = 0; j < navButtons.length; j++) navButtons[j].classList.remove('on');
-    this.classList.add('on');
-    var tabs = document.querySelectorAll('.tab');
-    for(var k = 0; k < tabs.length; k++) tabs[k].classList.remove('active');
-    var el = document.getElementById('t-' + this.dataset.t);
-    if(el) el.classList.add('active');
-    // Refresh data on tab switch
-    if(this.dataset.t === 'bookmarks') renderBookmarks();
-    if(this.dataset.t === 'tools') renderTools({has_key: !!($('#chatKeyStatus').textContent.indexOf('No API') === -1)});
-  });
-}
-
 // DASHBOARD
 function renderDashboard() {
-  var s = ANALYSIS.summary || {};
-  var years = ANALYSIS.yearly_distribution || {};
-  var mxY = 1;
-  for(var y in years) if(years[y] > mxY) mxY = years[y];
-  var topBT = ANALYSIS.behavioural_term_freq || [];
-  var topRT = ANALYSIS.region_term_freq || [];
-  var topAuthors = ANALYSIS.top_authors || [];
+  let s = ANALYSIS.summary || {};
+  let years = ANALYSIS.yearly_distribution || {};
+  let mxY = 1;
+  for(let y in years) if(years[y] > mxY) mxY = years[y];
+  let topBT = ANALYSIS.behavioural_term_freq || [];
+  let topRT = ANALYSIS.region_term_freq || [];
+  let topAuthors = ANALYSIS.top_authors || [];
 
-  var html = '<div class="stats">';
+  let html = '<div class="stats">';
   html += '<div class="stat"><div class="lbl">Papers</div><div class="val">' + (s.total_papers || 0) + '</div></div>';
   html += '<div class="stat"><div class="lbl">Authors</div><div class="val">' + (s.unique_authors || 0) + '</div><div class="sub">' + (s.avg_authors || 0) + ' avg/paper</div></div>';
   html += '<div class="stat"><div class="lbl">Range</div><div class="val" style="font-size:13px">' + (s.date_range || '--') + '</div></div>';
@@ -939,19 +899,19 @@ function renderDashboard() {
   html += '</div>';
   $('#dash-stats').innerHTML = html;
 
-  var barsHtml = '<div class="sec"><div class="sec-title">Publication Timeline</div><div class="bars">';
-  var yearKeys = Object.keys(years).sort();
-  for(var i = 0; i < yearKeys.length; i++) {
-    var yr = yearKeys[i], c = years[yr];
+  let barsHtml = '<div class="sec"><div class="sec-title">Publication Timeline</div><div class="bars">';
+  let yearKeys = Object.keys(years).sort();
+  for(let i = 0; i < yearKeys.length; i++) {
+    let yr = yearKeys[i], c = years[yr];
     barsHtml += '<div class="bar-row"><div class="bar-lbl">' + yr + '</div><div class="bar-track"><div class="bar-fill" style="width:' + (c / mxY * 100).toFixed(1) + '%"></div></div><div class="bar-val">' + c + '</div></div>';
   }
   barsHtml += '</div></div>';
 
   if(topAuthors.length) {
     barsHtml += '<div class="sec"><div class="sec-title">Top Authors</div><div class="bars">';
-    var mxA = topAuthors[0][1] || 1;
-    for(var a = 0; a < Math.min(10, topAuthors.length); a++) {
-      var au = topAuthors[a];
+    let mxA = topAuthors[0][1] || 1;
+    for(let a = 0; a < Math.min(10, topAuthors.length); a++) {
+      let au = topAuthors[a];
       barsHtml += '<div class="bar-row"><div class="bar-lbl" style="width:120px">' + esc(au[0].substring(0,18)) + '</div><div class="bar-track"><div class="bar-fill" style="width:' + (au[1] / mxA * 100).toFixed(1) + '%"></div></div><div class="bar-val">' + au[1] + '</div></div>';
     }
     barsHtml += '</div></div>';
@@ -959,9 +919,9 @@ function renderDashboard() {
 
   if(topBT.length) {
     barsHtml += '<div class="sec"><div class="sec-title">Behavioural Science Terms</div><div class="bars">';
-    var mxB = topBT[0][1] || 1;
-    for(var k = 0; k < Math.min(12, topBT.length); k++) {
-      var bt = topBT[k];
+    let mxB = topBT[0][1] || 1;
+    for(let k = 0; k < Math.min(12, topBT.length); k++) {
+      let bt = topBT[k];
       barsHtml += '<div class="bar-row"><div class="bar-lbl">' + bt[0] + '</div><div class="bar-track"><div class="bar-fill" style="width:' + (bt[1] / mxB * 100).toFixed(1) + '%"></div></div><div class="bar-val">' + bt[1] + '</div></div>';
     }
     barsHtml += '</div></div>';
@@ -969,8 +929,8 @@ function renderDashboard() {
 
   if(topRT.length) {
     barsHtml += '<div class="sec"><div class="sec-title">Regional Keywords</div><div class="tags">';
-    for(var j = 0; j < Math.min(15, topRT.length); j++) {
-      var t = topRT[j];
+    for(let j = 0; j < Math.min(15, topRT.length); j++) {
+      let t = topRT[j];
       barsHtml += '<span class="tag" onclick="document.getElementById(\'pSearch\').value=\'' + t[0] + '\';document.querySelector(\'[data-t=papers]\').click();doPSearch()">' + t[0] + ' <span style="color:var(--text4)">' + t[1] + '</span></span>';
     }
     barsHtml += '</div></div>';
@@ -981,54 +941,63 @@ function renderDashboard() {
 
 // PAPERS
 function initFilters() {
-  var years = {};
-  for(var i = 0; i < PAPERS.length; i++) {
-    var yr = (PAPERS[i].published || '').substring(0,4);
+  let years = {};
+  for(let i = 0; i < PAPERS.length; i++) {
+    let yr = (PAPERS[i].published || '').substring(0,4);
     if(yr) years[yr] = 1;
   }
-  var ykeys = Object.keys(years).sort().reverse();
-  var ysel = $('#pYear');
-  for(var j = 0; j < ykeys.length; j++) {
-    var o = document.createElement('option');
+  let ykeys = Object.keys(years).sort().reverse();
+  let ysel = $('#pYear');
+  for(let j = 0; j < ykeys.length; j++) {
+    let o = document.createElement('option');
     o.value = ykeys[j];
     o.textContent = ykeys[j];
     ysel.appendChild(o);
   }
 
-  var csel = $('#pConcept');
-  var conceptSet = {};
-  for(var ci = 0; ci < PAPERS.length; ci++) {
-    var tags = PAPERS[ci].tags || [];
-    for(var ti = 0; ti < tags.length; ti++) conceptSet[tags[ti]] = 1;
+  let csel = $('#pConcept');
+  let conceptSet = {};
+  for(let ci = 0; ci < PAPERS.length; ci++) {
+    let tags = PAPERS[ci].tags || [];
+    for(let ti = 0; ti < tags.length; ti++) conceptSet[tags[ti]] = 1;
   }
-  var ckeys = Object.keys(conceptSet).sort();
-  for(var ck = 0; ck < ckeys.length; ck++) {
-    var o2 = document.createElement('option');
+  let ckeys = Object.keys(conceptSet).sort();
+  for(let ck = 0; ck < ckeys.length; ck++) {
+    let o2 = document.createElement('option');
     o2.value = ckeys[ck];
     o2.textContent = ckeys[ck];
     csel.appendChild(o2);
   }
 }
 
+// Single clean doPSearch with search history tracking built in
+let lastSearchQuery = '';
+
 function doPSearch() {
-  var q = ($('#pSearch').value || '').toLowerCase();
-  var year = $('#pYear').value;
-  var concept = $('#pConcept').value;
-  var group = $('#pGroup').value;
+  let q = ($('#pSearch').value || '').toLowerCase().trim();
+  let year = $('#pYear').value;
+  let concept = $('#pConcept').value;
+  let group = $('#pGroup').value;
+
+  if(q.length >= 2 && q !== lastSearchQuery) {
+    addSearchQuery(q);
+    lastSearchQuery = q;
+  }
+
   curFiltered = [];
-  for(var i = 0; i < PAPERS.length; i++) {
-    var p = PAPERS[i];
+  for(let i = 0; i < PAPERS.length; i++) {
+    let p = PAPERS[i];
     if(year && !(p.published || '').startsWith(year)) continue;
     if(concept) {
-      var tags = p.tags || [];
-      var hasConcept = false;
-      for(var t = 0; t < tags.length; t++) {
+      let tags = p.tags || [];
+      let hasConcept = false;
+      for(let t = 0; t < tags.length; t++) {
         if(tags[t] === concept) { hasConcept = true; break; }
       }
       if(!hasConcept) continue;
     }
     if(q.length >= 2) {
-      var h = (p.title + ' ' + p.summary + ' ' + (p.authors || []).join(' ')).toLowerCase();
+      let h = (p.title + ' ' + p.summary + ' ' + (p.authors || []).join(' ')).toLowerCase();
       if(!h.includes(q)) continue;
     }
     curFiltered.push(p);
@@ -1038,28 +1007,28 @@ function doPSearch() {
 }
 
 function renderPapersFlat() {
-  var start = (curPage - 1) * CON_PAGE;
-  var page = curFiltered.slice(start, start + CON_PAGE);
-  var el = $('#pList');
+  let start = (curPage - 1) * CON_PAGE;
+  let page = curFiltered.slice(start, start + CON_PAGE);
+  let el = $('#pList');
   if(!page.length) {
     el.innerHTML = '<p style="padding:30px;text-align:center;color:var(--text4);font-size:12px;">No papers found.</p>';
     $('#pPag').innerHTML = '';
     return;
   }
-  var q = ($('#pSearch').value || '').toLowerCase();
-  var html = '';
-  for(var i = 0; i < page.length; i++) {
-    var p = page[i];
-    var idx = PAPERS.indexOf(p);
-    var d = (p.published || '').substring(0, 10);
-    var bookmarkClass = isBookmarked(p.id) ? 'bookmark-star bookmarked' : 'bookmark-star';
+  let q = ($('#pSearch').value || '').toLowerCase();
+  let html = '';
+  for(let i = 0; i < page.length; i++) {
+    let p = page[i];
+    let idx = PAPERS.indexOf(p);
+    let d = (p.published || '').substring(0, 10);
+    let bookmarkClass = isBookmarked(p.id) ? 'bookmark-star bookmarked' : 'bookmark-star';
     html += '<div class="pcard" tabindex="0" role="button" onclick="openReader(' + idx + ');selectedPaperIndex=' + idx + '" onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();openReader(' + idx + ');selectedPaperIndex=' + idx + '}">';
     html += '<div class="ptitle">' + escH(p.title, q) + ' <span class="' + bookmarkClass + '" onclick="event.stopPropagation();toggleBookmark(\'' + esc(p.id) + '\')">&#9733;</span></div>';
     html += '<div class="pauth">' + esc((p.authors || []).join(', ')) + '</div>';
     html += '<div class="pabs">' + escH((p.summary || '').substring(0, 200), q) + '</div>';
     html += '<div class="pmeta"><span class="badge ba">' + d + '</span>';
-    var tags = p.tags || [];
-    for(var t = 0; t < Math.min(3, tags.length); t++) {
+    let tags = p.tags || [];
+    for(let t = 0; t < Math.min(3, tags.length); t++) {
       html += '<span class="badge bb">' + esc(tags[t]) + '</span>';
     }
     html += '</div></div>';
@@ -1069,32 +1038,32 @@ function renderPapersFlat() {
 }
 
 function renderPGrouped(type) {
-  var groups = {};
-  for(var i = 0; i < curFiltered.length; i++) {
-    var p = curFiltered[i];
-    var k = 'Other';
+  let groups = {};
+  for(let i = 0; i < curFiltered.length; i++) {
+    let p = curFiltered[i];
+    let k = 'Other';
     if(type === 'year') k = (p.published || '').substring(0,4) || 'Unknown';
     else if(type === 'concept') {
-      var tags = p.tags || [];
+      let tags = p.tags || [];
       k = tags.length ? tags[0] : 'Untagged';
     }
     if(!groups[k]) groups[k] = [];
     groups[k].push(p);
   }
-  var entries = [];
-  for(var g in groups) entries.push([g, groups[g]]);
+  let entries = [];
+  for(let g in groups) entries.push([g, groups[g]]);
   if(type === 'year') entries.sort(function(a,b) { return b[0].localeCompare(a[0]); });
   else entries.sort(function(a,b) { return b[1].length - a[1].length; });
 
-  var html = '';
-  for(var e = 0; e < entries.length; e++) {
-    var grp = entries[e];
+  let html = '';
+  for(let e = 0; e < entries.length; e++) {
+    let grp = entries[e];
     html += '<div class="grp"><div class="grp-hd" tabindex="0" onclick="this.parentElement.classList.toggle(\'grp-collapsed\')" onkeydown="if(event.key===\'Enter\'||event.key===\' \'){this.parentElement.classList.toggle(\'grp-collapsed\')}">';
     html += '<h3>' + esc(grp[0]) + ' <span style="font-weight:400;color:var(--text4);margin-left:4px">' + grp[1].length + ' paper' + (grp[1].length !== 1 ? 's' : '') + '</span></h3></div>';
     html += '<div class="grp-body">';
-    for(var p2 = 0; p2 < grp[1].length; p2++) {
-      var pp = grp[1][p2];
-      html += '<div class="pcard" tabindex="0" role="button" onclick="openReader(' + PAPERS.indexOf(pp) + ');selectedPaperIndex=' + PAPERS.indexOf(pp) + ')" onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();openReader(' + PAPERS.indexOf(pp) + ');selectedPaperIndex=' + PAPERS.indexOf(pp) + '}"><div class="ptitle">' + esc(pp.title) + '</div><div class="pmeta"><span class="badge ba">' + (pp.published || '').substring(0,10) + '</span></div></div>';
+    for(let p2 = 0; p2 < grp[1].length; p2++) {
+      let pp = grp[1][p2];
+      html += '<div class="pcard" tabindex="0" role="button" onclick="openReader(' + PAPERS.indexOf(pp) + ');selectedPaperIndex=' + PAPERS.indexOf(pp) + '" onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();openReader(' + PAPERS.indexOf(pp) + ');selectedPaperIndex=' + PAPERS.indexOf(pp) + '}"><div class="ptitle">' + esc(pp.title) + '</div><div class="pmeta"><span class="badge ba">' + (pp.published || '').substring(0,10) + '</span></div></div>';
     }
     html += '</div></div>';
   }
@@ -1103,15 +1072,15 @@ function renderPGrouped(type) {
 }
 
 function renderPag(total, size, elId, cb) {
-  var el = document.getElementById(elId);
-  var tp = Math.ceil(total / size);
+  let el = document.getElementById(elId);
+  let tp = Math.ceil(total / size);
   if(tp <= 1) { el.innerHTML = ''; return; }
   el.innerHTML = '';
-  for(var i = 1; i <= tp; i++) {
-    var b = document.createElement('button');
+  for(let i = 1; i <= tp; i++) {
+    let b = document.createElement('button');
     b.textContent = i;
     if(i === curPage) b.className = 'active';
-    (function(n) { b.onclick = function() { cb(n); }; })(i);
+    b.onclick = function(n) { return function() { cb(n); }; }(i);
     el.appendChild(b);
   }
 }
@@ -1120,15 +1089,15 @@ function renderPapers() { doPSearch(); }
 
 // CONCEPTS - AI CLUSTERING
 function runClustering() {
-  var btn = $('#clusterBtn');
-  var status = $('#clusterStatus');
+  let btn = $('#clusterBtn');
+  let status = $('#clusterStatus');
   btn.disabled = true;
   btn.textContent = 'Clustering...';
   showSpinner('conceptsList');
-  var maxPapers = parseInt($('#clusterMax').value) || 50;
+  let maxPapers = parseInt($('#clusterMax').value) || 50;
   status.textContent = 'Clustering ' + maxPapers + ' papers...';
 
-  var payload = {max: maxPapers};
+  let payload = {max: maxPapers};
   if (clusters && clusters.clusters) {
     payload.existing = clusters.clusters;
   }
@@ -1140,12 +1109,12 @@ function runClustering() {
       status.className = 'status-badge err';
       return;
     }
-    var prevTotal = clusters ? (clusters.papers_analyzed || 0) : 0;
+    let prevTotal = clusters ? (clusters.papers_analyzed || 0) : 0;
     clusters = data;
-    var total = data.papers_analyzed || 0;
-    var nClusters = (data.clusters && data.clusters.clusters) ? data.clusters.clusters.length : 0;
-    var merged = data.merged || false;
-    var msg = 'Clustered ' + total + ' papers into ' + nClusters + ' themes';
+    let total = data.papers_analyzed || 0;
+    let nClusters = (data.clusters && data.clusters.clusters) ? data.clusters.clusters.length : 0;
+    let merged = data.merged || false;
+    let msg = 'Clustered ' + total + ' papers into ' + nClusters + ' themes';
     if (merged && prevTotal > 0) {
       msg += ' (was ' + prevTotal + ')';
     }
@@ -1156,18 +1125,18 @@ function runClustering() {
 }
 
 function renderClusters() {
-   var el = $('#conceptsList');
+   let el = $('#conceptsList');
    if(!clusters || !clusters.clusters) {
      el.innerHTML = '<p style="padding:20px;color:var(--text4);font-size:12px;">Click "Run AI Clustering" to analyse papers and discover concept clusters.</p>';
      return;
    }
-   var cl = clusters.clusters.clusters || [];
-   var unclustered = clusters.clusters.unclustered || [];
-   var html = '';
+   let cl = clusters.clusters.clusters || [];
+   let unclustered = clusters.clusters.unclustered || [];
+   let html = '';
 
-   for(var i = 0; i < cl.length; i++) {
-     var c = cl[i];
-     var indices = c.paper_indices || [];
+   for(let i = 0; i < cl.length; i++) {
+     let c = cl[i];
+     let indices = c.paper_indices || [];
      html += '<div class="concept-card" tabindex="0" role="button" aria-label="View papers in cluster: ' + esc(c.name) + '" onclick="showClusterPapers(' + i + ')" onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();showClusterPapers(' + i + ')}">';
      html += '<div class="cname">' + esc(c.name) + '</div>';
      html += '<div class="cdesc">' + esc(c.description || '') + '</div>';
@@ -1187,9 +1156,9 @@ function renderClusters() {
 }
 
 function showClusterPapers(idx) {
-  var papers = [];
-  var indices = clusters.clusters.clusters[idx].paper_indices || [];
-  for(var i = 0; i < indices.length; i++) {
+  let papers = [];
+  let indices = clusters.clusters.clusters[idx].paper_indices || [];
+  for(let i = 0; i < indices.length; i++) {
     if(indices[i] < PAPERS.length) papers.push(PAPERS[indices[i]]);
   }
   curFiltered = papers;
@@ -1199,9 +1168,9 @@ function showClusterPapers(idx) {
 }
 
 function showUnclusteredPapers() {
-  var unclustered = clusters.clusters.unclustered || [];
-  var papers = [];
-  for(var i = 0; i < unclustered.length; i++) {
+  let unclustered = clusters.clusters.unclustered || [];
+  let papers = [];
+  for(let i = 0; i < unclustered.length; i++) {
     if(unclustered[i] < PAPERS.length) papers.push(PAPERS[unclustered[i]]);
   }
   curFiltered = papers;
@@ -1212,7 +1181,7 @@ function showUnclusteredPapers() {
 
 // CHAT
 function renderChatStatus(keyInfo) {
-  var el = $('#chatKeyStatus');
+  let el = $('#chatKeyStatus');
   if(keyInfo && keyInfo.has_key) {
     el.innerHTML = '<span class="status-badge ok">API Key: ' + esc(keyInfo.model || 'configured') + '</span>';
   } else {
@@ -1221,55 +1190,55 @@ function renderChatStatus(keyInfo) {
 }
 
 function sendChat() {
-  var input = $('#chatInput');
-  var query = input.value.trim();
+  let input = $('#chatInput');
+  let query = input.value.trim();
   if(!query) return;
   input.value = '';
   showSpinner('chatLog');
 
-  var log = $('#chatLog');
-  var userDiv = document.createElement('div');
+  let log = $('#chatLog');
+  let userDiv = document.createElement('div');
   userDiv.className = 'chat-msg user';
   userDiv.innerHTML = '<div class="chat-label">You</div><div class="chat-bubble">' + esc(query) + '</div>';
   log.appendChild(userDiv);
 
-  var loadingDiv = document.createElement('div');
+  let loadingDiv = document.createElement('div');
   loadingDiv.className = 'chat-msg ai';
   loadingDiv.innerHTML = '<div class="chat-label">AI</div><div class="chat-bubble" style="color:var(--text4);">Thinking...</div>';
   log.appendChild(loadingDiv);
   log.scrollTop = log.scrollHeight;
 
-  var historyPayload = chatHistory.slice(-20);
+  let historyPayload = chatHistory.slice(-20);
 
   apiPost('/api/chat', {query: query, paper_ids: [], history: historyPayload}, function(err, data) {
     if(err) {
       loadingDiv.innerHTML = '<div class="chat-label">AI</div><div class="chat-bubble" style="color:var(--red);">Error: ' + esc(err.message) + '</div>';
       return;
     }
-    var response = data.response || {};
-    var content = response.content || response.reasoning || 'No response from AI';
-    var papersUsed = data.papers_used || [];
+    let response = data.response || {};
+    let content = response.content || response.reasoning || 'No response from AI';
+    let papersUsed = data.papers_used || [];
 
-    var rendered = esc(content).replace(/\[Paper (\d+)\]/g, function(match, num) {
-      var idx = parseInt(num) - 1;
+    let rendered = esc(content).replace(/\[Paper (\d+)\]/g, function(match, num) {
+      let idx = parseInt(num) - 1;
       if(idx >= 0 && idx < papersUsed.length) {
-        var pid = papersUsed[idx].id || '';
-        var ptitle = papersUsed[idx].title || 'Paper ' + num;
-        var shortTitle = ptitle.length > 50 ? ptitle.slice(0,50) + '...' : ptitle;
+        let pid = papersUsed[idx].id || '';
+        let ptitle = papersUsed[idx].title || 'Paper ' + num;
+        let shortTitle = ptitle.length > 50 ? ptitle.slice(0,50) + '...' : ptitle;
         return '<span class="chat-citation" style="cursor:pointer;text-decoration:underline;color:var(--accent);" onclick="openReaderById(\'' + esc(pid) + '\')" title="' + esc(ptitle) + '">' + esc(shortTitle) + '</span>';
       }
       return match;
     });
 
-    var html = '<div class="chat-label">AI</div><div class="chat-bubble">' + rendered + '</div>';
+    let html = '<div class="chat-label">AI</div><div class="chat-bubble">' + rendered + '</div>';
 
     if(papersUsed.length) {
       html += '<div style="margin-top:10px;border-top:1px solid var(--border-sub);padding-top:8px;">';
       html += '<div style="font-size:10px;color:var(--text4);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px;">References</div>';
-      for(var i = 0; i < papersUsed.length; i++) {
-        var p = papersUsed[i];
-        var title = p.title || 'Untitled';
-        var pid = p.id || '';
+      for(let i = 0; i < papersUsed.length; i++) {
+        let p = papersUsed[i];
+        let title = p.title || 'Untitled';
+        let pid = p.id || '';
         html += '<div style="display:flex;align-items:start;gap:6px;margin-bottom:4px;font-size:11px;">';
         html += '<span style="color:var(--accent);font-family:var(--mono);flex-shrink:0;">[' + (i+1) + ']</span>';
         html += '<span style="flex:1;"><a href="#" onclick="openReaderById(\'' + esc(pid) + '\');return false;" style="color:var(--text2);text-decoration:none;" onmouseover="this.style.textDecoration=\'underline\'" onmouseout="this.style.textDecoration=\'none\'">' + esc(title) + '</a></span>';
@@ -1292,8 +1261,8 @@ function clearChat() {
 
 function openReaderById(pid) {
   if(!pid) return;
-  var idx = -1;
-  for(var i = 0; i < PAPERS.length; i++) {
+  let idx = -1;
+  for(let i = 0; i < PAPERS.length; i++) {
     if(PAPERS[i].id === pid) { idx = i; break; }
   }
   if(idx >= 0) openReader(idx);
@@ -1328,21 +1297,20 @@ function readerKeys(e) {
 }
 
 function renderReader() {
-  var p = readerList[readerIdx];
+  let p = readerList[readerIdx];
   if(!p) return;
   $('#rNav').textContent = (readerIdx + 1) + ' / ' + readerList.length;
-  var pdfLink = p.pdf_url || p.url || '';
+  let pdfLink = p.pdf_url || p.url || '';
   $('#rPdf').dataset.url = pdfLink;
 
-  var html = '<div class="reader-title">' + esc(p.title) + '</div>';
+  let html = '<div class="reader-title">' + esc(p.title) + '</div>';
   html += '<div class="reader-auth">' + esc((p.authors || []).join(', ')) + '</div>';
   html += '<div class="reader-date">' + esc(p.published || '') + '</div>';
   html += '<div class="reader-abs"><h2>Abstract</h2>' + esc(p.summary || 'No abstract available.') + '</div>';
   html += '<div class="reader-actions">';
   html += '<button onclick="summarisePaper()">Summarise with AI</button>';
-  // Bookmark button in reader
-  var isBm = isBookmarked(p.id);
-  var bmClass = isBm ? 'bookmark-star bookmarked' : 'bookmark-star';
+  let isBm = isBookmarked(p.id);
+  let bmClass = isBm ? 'bookmark-star bookmarked' : 'bookmark-star';
   html += '<button class="sec" onclick="toggleBookmark(\'' + esc(p.id) + '\')" title="Toggle bookmark">&#9733;</button>';
   if(pdfLink) html += '<button class="sec" onclick="window.open(\'' + pdfLink + '\',\'_blank\')">Open PDF</button>';
   html += '</div>';
@@ -1351,8 +1319,8 @@ function renderReader() {
 }
 
 function summarisePaper() {
-  var p = readerList[readerIdx];
-  var el = $('#readerAnalysis');
+  let p = readerList[readerIdx];
+  let el = $('#readerAnalysis');
   el.innerHTML = '<div class="reader-analysis" style="color:var(--text4);font-size:12px;">Analysing with AI...</div>';
 
   apiPost('/api/summarise', {idx: readerIdx, id: p.id}, function(err, data) {
@@ -1360,8 +1328,8 @@ function summarisePaper() {
       el.innerHTML = '<div class="reader-analysis" style="color:var(--red);font-size:12px;">Error: ' + esc(err.message) + '</div>';
       return;
     }
-    var analysis = data.analysis || {};
-    var html = '<div class="reader-analysis">';
+    let analysis = data.analysis || {};
+    let html = '<div class="reader-analysis">';
     html += '<div class="sec-title" style="margin-bottom:10px;">AI Analysis</div>';
     html += '<div class="analysis-grid">';
     html += '<div class="analysis-item"><div class="lbl">Behavioural Model</div><div class="val">' + esc(analysis.behavioural_model || analysis.behavioral_model || 'N/A') + '</div></div>';
@@ -1384,7 +1352,7 @@ function summarisePaper() {
 }
 
 // TOOLS
-var QUERY_GROUPS = {
+const QUERY_GROUPS = {
   "COM-B Model": "COM-B behaviour change capability opportunity motivation",
   "Theory of Planned Behaviour (TPB)": "theory of planned behaviour TPB attitude subjective norm perceived behavioural control",
   "Health Belief Model (HBM)": "health belief model HBM perceived susceptibility severity benefits barriers self-efficacy",
@@ -1404,8 +1372,107 @@ var QUERY_GROUPS = {
   "Quantitative Methods": "survey questionnaire regression correlation experimental behavioural science"
 };
 
+let selectedQueries = [];
+
+function renderQueryTags() {
+  let el = document.getElementById('queryTags');
+  if(!el) return;
+  if(selectedQueries.length === 0) {
+    el.innerHTML = '';
+    return;
+  }
+  let html = '';
+  for(let i = 0; i < selectedQueries.length; i++) {
+    html += '<span class="q-chip"><span class="q-text">' + esc(selectedQueries[i]) + '</span><span class="q-del" onclick="removeQuery(' + i + ')">&times;</span></span>';
+  }
+  el.innerHTML = html;
+}
+
+function removeQuery(idx) {
+  selectedQueries.splice(idx, 1);
+  renderQueryTags();
+}
+
+function togglePreset(btn, queryGroup) {
+  let idx = -1;
+  for(let i = 0; i < selectedQueries.length; i++) {
+    if(selectedQueries[i] === queryGroup) { idx = i; break; }
+  }
+  if(idx >= 0) {
+    selectedQueries.splice(idx, 1);
+    btn.classList.remove('added');
+  } else {
+    selectedQueries.push(queryGroup);
+    btn.classList.add('added');
+  }
+  renderQueryTags();
+}
+
+function addCustomQuery() {
+  let input = document.getElementById('scraperQueryCustom');
+  if(!input) return;
+  let q = input.value.trim();
+  if(q.length < 2) return;
+  for(let i = 0; i < selectedQueries.length; i++) {
+    if(selectedQueries[i] === q) return;
+  }
+  selectedQueries.push(q);
+  input.value = '';
+  renderQueryTags();
+}
+
+function runScraper() {
+  if(selectedQueries.length === 0) {
+    alert('Select or add at least one query first.');
+    return;
+  }
+  let srcObj = {
+    arxiv: document.getElementById('srcArxiv').checked,
+    pubmed: document.getElementById('srcPubmed').checked,
+    semanticscholar: document.getElementById('srcSS').checked,
+    crossref: document.getElementById('srcCrossref').checked
+  };
+  let maxCount = parseInt(document.getElementById('scraperMax').value, 10) || 20;
+  let log = document.getElementById('scraperLog');
+  if(log) {
+    log.style.display = 'block';
+    log.textContent = 'Starting scraper...\n';
+  }
+  fetch('/api/scraper/run', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({queries: selectedQueries, sources: srcObj, max: maxCount})
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(data) {
+    if(log) log.textContent += data.message + '\n';
+  })
+  .catch(function(err) {
+    if(log) log.textContent += 'Error: ' + err + '\n';
+  });
+}
+
+function checkScraperStatus() {
+  let log = document.getElementById('scraperLog');
+  if(log) {
+    log.style.display = 'block';
+    log.textContent = 'Checking status...\n';
+  }
+  fetch('/api/scraper/status')
+  .then(function(r) { return r.json(); })
+  .then(function(data) {
+    if(log) {
+      log.textContent = '';
+      log.textContent += data.output + '\n';
+    }
+  })
+  .catch(function(err) {
+    if(log) log.textContent += 'Error checking status: ' + err + '\n';
+  });
+}
+
 function renderTools(keyInfo) {
-  var html = '';
+  let html = '';
 
   // ── API Key ──────────────────────────────────────────────────────────────
   html += '<div class="tool-section">';
@@ -1431,7 +1498,7 @@ function renderTools(keyInfo) {
   html += '<div class="q-chips" id="queryTags"></div>';
 
   html += '<div class="presets-grid" id="presetsGrid">';
-  for(var qg in QUERY_GROUPS) {
+  for(let qg in QUERY_GROUPS) {
     html += '<button class="preset-btn" onclick="togglePreset(this,\'' + esc(qg) + '\')" title="' + esc(QUERY_GROUPS[qg]) + '">' + esc(qg) + '</button>';
   }
   html += '</div>';
@@ -1550,9 +1617,8 @@ function renderTools(keyInfo) {
   $('#tools-content').innerHTML = html;
   renderQueryTags();
   renderSearchHistory();
-  // Bind Enter key for custom query
   setTimeout(function() {
-    var inp = $('#scraperQueryCustom');
+    let inp = $('#scraperQueryCustom');
     if(inp) inp.addEventListener('keydown', function(e) {
       if(e.key === 'Enter') { e.preventDefault(); addCustomQuery(); }
     });
@@ -1560,9 +1626,9 @@ function renderTools(keyInfo) {
 }
 
 function saveApiKey() {
-  var key = $('#apiKeyInput').value.trim();
+  let key = $('#apiKeyInput').value.trim();
   if(!key) return;
-  var btn = $('#keyStatus');
+  let btn = $('#keyStatus');
   showSpinner('keyStatus');
   apiPost('/api/config/key', {key: key}, function(err, data) {
     if(err) {
@@ -1575,9 +1641,9 @@ function saveApiKey() {
 }
 
 function checkServerStatus() {
-  var el = $('#serverStatus');
+  let el = $('#serverStatus');
   el.innerHTML = '<span class="status-badge warn">Checking...</span>';
-  var t = Date.now();
+  let t = Date.now();
   apiGet('/api/papers', function(err, data) {
     if(err) {
       el.innerHTML = '<span class="status-badge err">Offline</span>';
@@ -1588,55 +1654,75 @@ function checkServerStatus() {
 }
 
 function shutdownServer() {
-  var el = $('#serverStatus');
+  let el = $('#serverStatus');
   el.innerHTML = '<span class="status-badge warn">Shutting down...</span>';
   apiGet('/api/shutdown', function(err) {
     el.innerHTML = '<span class="status-badge err">Server stopped. Close this tab.</span>';
   });
 }
 
-// EXPORT
-function exportPapers(scope) {
-  var fmt = $('#exportFormat').value;
-  var q = '';
-  if(scope === 'search') {
-    q = $('#pSearch').value;
-    if(!q || q.length < 2) { alert('Enter at least 2 characters to search, or choose "All Papers".'); return; }
-  }
-  var url = '/api/export?format=' + fmt;
-  if(q) url += '&q=' + encodeURIComponent(q);
-  fetch(url).then(function(resp) {
-    if(!resp.ok) { return resp.json().then(function(d) { throw new Error(d.error || 'Export failed'); }); }
-    var cd = resp.headers.get('Content-Disposition');
-    var fname = 'export';
-    if(cd) { var m = cd.match(/filename="([^"]+)"/); if(m) fname = m[1]; }
-    return resp.blob().then(function(blob) {
-      var a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = fname;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(a.href);
-      // Show success banner
-      var banner = $('#exportBanner');
-      if(banner) {
-        banner.style.display = 'block';
-        banner.textContent = '✓ Exported ' + (scope === 'search' ? 'search results' : 'all papers') + ' as ' + fmt.toUpperCase();
-        setTimeout(function() { banner.style.display = 'none'; }, 3000);
+// INIT
+function init() {
+  apiGet('/api/init', function(err, data) {
+    if(err) {
+      document.getElementById('loading-overlay').classList.add('hidden');
+      console.error('Init error:', err);
+      document.body.innerHTML = '<div style="padding:60px;text-align:center;color:var(--text3);font-size:13px">Failed to connect to server.<br>Make sure the server is running with <code style="background:var(--surface);padding:2px 6px;border-radius:4px">python server.py</code><br><br><span style="color:var(--text4);font-size:11px">' + esc(err.message) + '</span></div>';
+      return;
+    }
+    PAPERS = data.papers_meta || [];
+    ANALYSIS = data.analysis || {};
+    let keyInfo = data.key || {};
+    curFiltered = PAPERS.slice();
+    selectedPaperIndex = 0;
+    renderDashboard();
+    renderPapers();
+    renderTools(keyInfo);
+    renderChatStatus(keyInfo);
+    renderBookmarks();
+    renderSearchHistory();
+    initFilters();
+    document.getElementById('loading-overlay').classList.add('hidden');
+    apiGet('/api/papers?q=', function(err2, data2) {
+      if(err2 || !data2 || !data2.papers || !data2.papers.length) {
+        console.warn('Full papers deferred:', err2 ? err2.message : 'empty response');
+        return;
       }
+      PAPERS = data2.papers;
+      curFiltered = PAPERS.slice();
+      renderPapers();
+      renderBookmarks();
+      renderSearchHistory();
+      initFilters();
     });
-  }).catch(function(err) {
-    alert('Export error: ' + err.message);
+  });
+}
+init();
+
+// Note: auto-shutdown on tab close disabled because it kills the server on refresh.
+// Use the Shutdown button in Tools tab for intentional shutdown.
+
+// Tab navigation
+let navButtons = document.querySelectorAll('#mainNav button');
+for(let i = 0; i < navButtons.length; i++) {
+  navButtons[i].addEventListener('click', function() {
+    for(let j = 0; j < navButtons.length; j++) navButtons[j].classList.remove('on');
+    this.classList.add('on');
+    let tabs = document.querySelectorAll('.tab');
+    for(let k = 0; k < tabs.length; k++) tabs[k].classList.remove('active');
+    let el = document.getElementById('t-' + this.dataset.t);
+    if(el) el.classList.add('active');
+    if(this.dataset.t === 'bookmarks') renderBookmarks();
+    if(this.dataset.t === 'tools') renderTools({has_key: !!($('#chatKeyStatus').textContent.indexOf('No API') === -1)});
   });
 }
 
 // KEYBOARD SHORTCUTS
-var shortcutModalOpen = false;
-var shortcutPrefix = false;
+let shortcutModalOpen = false;
+let shortcutPrefix = false;
 
 function toggleShortcutModal() {
-  var el = $('#shortcutModal');
+  let el = $('#shortcutModal');
   shortcutModalOpen = !shortcutModalOpen;
   el.classList.toggle('open', shortcutModalOpen);
 }
@@ -1647,54 +1733,45 @@ function closeShortcutModal() {
 }
 
 document.addEventListener('keydown', function(e) {
-  // Escape: close reader or shortcuts modal
   if(e.key === 'Escape') {
     if(shortcutModalOpen) { closeShortcutModal(); return; }
-    var reader = $('#reader');
+    let reader = $('#reader');
     if(reader.classList.contains('open')) { closeReader(); return; }
-    // Blur any focused input
     if(document.activeElement && document.activeElement.tagName === 'INPUT') {
       document.activeElement.blur();
     }
     return;
   }
 
-  // If shortcuts modal is open, ignore other shortcuts
   if(shortcutModalOpen) return;
 
-  // If reader is open, only Escape/Arrows are handled by readerKeys
   if($('#reader').classList.contains('open')) return;
 
-  // / key: focus search bar (unless in input already)
   if(e.key === '/' && e.target.tagName !== 'INPUT' && e.target.tagName !== 'TEXTAREA') {
     e.preventDefault();
-    var searchInput = $('#pSearch');
+    let searchInput = $('#pSearch');
     if(searchInput) { searchInput.focus(); searchInput.select(); }
     return;
   }
 
-  // g prefix for navigation
   if(shortcutPrefix === 'g' && e.key.length === 1) {
-    var key = e.key.toLowerCase();
-    var navMap = { 'd': 'dashboard', 'p': 'papers', 'c': 'concepts', 't': 'chat', 'b': 'bookmarks', 'o': 'tools' };
+    let key = e.key.toLowerCase();
+    let navMap = { 'd': 'dashboard', 'p': 'papers', 'c': 'concepts', 'g': 'graph', 't': 'chat', 'b': 'bookmarks', 'o': 'tools' };
     if(navMap[key]) {
       e.preventDefault();
-      var btn = document.querySelector('[data-t="' + navMap[key] + '"]');
+      let btn = document.querySelector('[data-t="' + navMap[key] + '"]');
       if(btn) btn.click();
     }
     shortcutPrefix = false;
     return;
   }
 
-  // g key: set prefix
   if(e.key.toLowerCase() === 'g' && !shortcutPrefix) {
     shortcutPrefix = 'g';
-    // Reset prefix after short delay
     setTimeout(function() { shortcutPrefix = false; }, 1000);
     return;
   }
 
-  // j/k: next/prev paper in list (when on papers tab)
   if($('#t-papers').classList.contains('active') && !$(document.activeElement).closest('.sinp')) {
     if(e.key === 'j') {
       e.preventDefault();
@@ -1714,41 +1791,6 @@ document.addEventListener('keydown', function(e) {
     }
   }
 });
-
-// Track search queries for history
-var lastSearchQuery = '';
-var originalDoPSearch = typeof doPSearch === 'function' ? doPSearch : null;
-doPSearch = function() {
-  var q = ($('#pSearch').value || '').toLowerCase().trim();
-  if(q.length >= 2 && q !== lastSearchQuery) {
-    addSearchQuery(q);
-    lastSearchQuery = q;
-  }
-  // Run original search
-  var year = $('#pYear').value;
-  var concept = $('#pConcept').value;
-  var group = $('#pGroup').value;
-  curFiltered = [];
-  for(var i = 0; i < PAPERS.length; i++) {
-    var p = PAPERS[i];
-    if(year && !(p.published || '').startsWith(year)) continue;
-    if(concept) {
-      var tags = p.tags || [];
-      var hasConcept = false;
-      for(var t = 0; t < tags.length; t++) {
-        if(tags[t] === concept) { hasConcept = true; break; }
-      }
-      if(!hasConcept) continue;
-    }
-    if(q.length >= 2) {
-      var h = (p.title + ' ' + p.summary + ' ' + (p.authors || []).join(' ')).toLowerCase();
-      if(!h.includes(q)) continue;
-    }
-    curFiltered.push(p);
-  }
-  curPage = 1;
-  if(group) renderPGrouped(group); else renderPapersFlat();
-};
 
 // Shortcut prefix timeout reset
 setInterval(function() { if(shortcutPrefix) shortcutPrefix = false; }, 1100);

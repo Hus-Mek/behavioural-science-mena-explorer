@@ -5,6 +5,7 @@ Covers: behavioural models (COM-B, TPB, HBM, SCT, SDT, etc.),
           Arabic/MENA regional terms, broad behavioural science, grey literature.
 """
 import requests
+from requests.exceptions import Timeout, ConnectionError, RequestException
 import xml.etree.ElementTree as ET
 import time
 import os
@@ -12,6 +13,7 @@ import json
 import re
 import argparse
 import shutil
+import random
 from pathlib import Path
 from collections import Counter
 
@@ -193,7 +195,6 @@ for _group in ALL_QUERY_GROUPS.values():
 
 
 def load_existing_ids(data_dir):
-    """Load all existing paper IDs from data/raw/papers_*.json files."""
     ids = set()
     for f in Path(data_dir).glob("papers_*.json"):
         try:
@@ -208,12 +209,27 @@ def load_existing_ids(data_dir):
                         if doi:
                             doi_norm = doi.lower().strip().replace("https://doi.org/", "").replace("doi:", "").strip()
                             ids.add(f"DOI:{doi_norm}")
-        except Exception:
+        except (json.JSONDecodeError, FileNotFoundError, OSError):
             pass
     return ids
 
 
 class MultiSourceScraper:
+    SOURCE_METHODS = {
+        'arxiv': 'search_arxiv',
+        'pubmed': 'search_pubmed',
+        'pubmedcentral': 'search_pubmedcentral',
+        'semanticscholar': 'search_semanticscholar',
+        'crossref': 'search_crossref',
+        'openalex': 'search_openalex',
+        'biorxiv': 'search_biorxiv',
+        'psyarxiv': 'search_psyarxiv',
+        'osf': 'search_osf',
+        'researchgate': 'search_researchgate',
+        'libgen': 'search_libgen',
+        'annas': 'search_annas_archive',
+    }
+
     def __init__(self, delay=3):
         self.data_dir = Path("data/raw")
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -229,6 +245,17 @@ class MultiSourceScraper:
         else:
             return _SimplePbar(total, desc)
 
+    def _search_all_sources(self, query, sources, max_results, arxiv_query=None):
+        papers = []
+        for src in sources:
+            method_name = self.SOURCE_METHODS.get(src)
+            if method_name is None:
+                continue
+            print(f"  {src}...")
+            q = arxiv_query if src == 'arxiv' and arxiv_query else query
+            papers.extend(getattr(self, method_name)(q, max_results))
+        return papers
+
     # ── arXiv ─────────────────────────────────────────────────────────────
     def search_arxiv(self, query, max_results=100):
         papers = []
@@ -242,22 +269,45 @@ class MultiSourceScraper:
             }
             try:
                 r = self.session.get("http://export.arxiv.org/api/query", params=params, timeout=30)
-                time.sleep(self.delay)
+            except (Timeout, ConnectionError) as e:
+                print(f"  arXiv network error (retrying once): {e}")
+                time.sleep(self.delay * 2)
+                try:
+                    r = self.session.get("http://export.arxiv.org/api/query", params=params, timeout=60)
+                except (Timeout, ConnectionError) as e2:
+                    print(f"  arXiv error after retry: {e2}")
+                    break
+            except RequestException as e:
+                print(f"  arXiv request error: {e}")
+                break
+            jitter = random.uniform(0, 1)
+            time.sleep(self.delay + jitter)
+            try:
                 root = ET.fromstring(r.text)
-            except Exception as e:
-                print(f"  arXiv error: {e}")
+            except ET.ParseError as e:
+                print(f"  arXiv XML parse error: {e}")
                 break
             ns = {'atom': 'http://www.w3.org/2005/Atom'}
             entries = root.findall('{%s}entry' % ns['atom'])
             if not entries:
                 break
             for entry in entries:
-                eid = entry.find('{%s}id' % ns['atom']).text
+                eid_el = entry.find('{%s}id' % ns['atom'])
+                if eid_el is None or eid_el.text is None:
+                    continue
+                eid = eid_el.text
                 arxiv_id = eid.split('/')[-1]
-                title = entry.find('{%s}title' % ns['atom']).text.strip().replace('\n', ' ')
-                authors = [a.find('{%s}name' % ns['atom']).text for a in entry.findall('{%s}author' % ns['atom'])]
-                summary = entry.find('{%s}summary' % ns['atom']).text.strip().replace('\n', ' ')
-                published = entry.find('{%s}published' % ns['atom']).text
+                title_el = entry.find('{%s}title' % ns['atom'])
+                title = title_el.text.strip().replace('\n', ' ') if title_el is not None and title_el.text is not None else "No title"
+                authors = []
+                for a in entry.findall('{%s}author' % ns['atom']):
+                    name_el = a.find('{%s}name' % ns['atom'])
+                    if name_el is not None and name_el.text is not None:
+                        authors.append(name_el.text)
+                summary_el = entry.find('{%s}summary' % ns['atom'])
+                summary = summary_el.text.strip().replace('\n', ' ') if summary_el is not None and summary_el.text is not None else ""
+                published_el = entry.find('{%s}published' % ns['atom'])
+                published = published_el.text if published_el is not None else ""
                 pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
                 papers.append({
                     'id': arxiv_id, 'title': title, 'authors': authors,
@@ -276,42 +326,57 @@ class MultiSourceScraper:
         papers = []
         pbar = self._pbar(min(max_results, 200), f"PubMed:{query[:20]}")
         try:
-            # Search
             r = self.session.get(
                 "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
                 params={'db': 'pubmed', 'retmode': 'json', 'retmax': max_results, 'term': query},
                 timeout=30
             )
-            ids = r.json().get('esearchresult', {}).get('idlist', [])
+            r.raise_for_status()
+            try:
+                search_data = r.json()
+            except json.JSONDecodeError as e:
+                print(f"  PubMed JSON parse error: {e}")
+                pbar.close()
+                return []
+            ids = search_data.get('esearchresult', {}).get('idlist', [])
             if not ids:
                 pbar.close()
                 return []
-            time.sleep(0.5)
-            # Fetch
+            jitter = random.uniform(0, 0.5)
+            time.sleep(0.5 + jitter)
             r2 = self.session.get(
                 "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi",
                 params={'db': 'pubmed', 'retmode': 'xml', 'id': ','.join(ids[:max_results])},
                 timeout=30
             )
-            root = ET.fromstring(r2.text)
+            try:
+                root = ET.fromstring(r2.text)
+            except ET.ParseError as e:
+                print(f"  PubMed XML parse error: {e}")
+                pbar.close()
+                return []
             for article in root.findall('.//MedlineCitation'):
-                pmid = article.find('PMID').text
+                pmid_el = article.find('PMID')
+                if pmid_el is None or pmid_el.text is None:
+                    continue
+                pmid = pmid_el.text
                 at = article.find('.//ArticleTitle')
-                title = at.text if at is not None else "No title"
+                title = at.text.strip().replace('\n', ' ') if at is not None and at.text is not None else "No title"
                 abstract_el = article.find('.//Abstract/AbstractText')
-                summary = abstract_el.text if abstract_el is not None else ""
+                summary = abstract_el.text if abstract_el is not None and abstract_el.text is not None else ""
                 journal_el = article.find('.//Journal/Title')
-                journal = journal_el.text if journal_el is not None else ""
+                journal = journal_el.text if journal_el is not None and journal_el.text is not None else ""
                 year_el = article.find('.//Journal/JournalIssue/PubDate/Year')
                 if year_el is None:
                     year_el = article.find('.//ArticleDate/Year')
-                year = year_el.text if year_el is not None else "2024"
+                year = year_el.text if year_el is not None and year_el.text is not None else "2024"
                 authors = []
                 for a in article.findall('.//Author'):
                     ln = a.find('LastName')
                     fn = a.find('ForeName')
-                    if ln is not None:
-                        authors.append(f"{ln.text} {fn.text if fn is not None else ''}".strip())
+                    if ln is not None and ln.text is not None:
+                        fn_text = fn.text if fn is not None and fn.text is not None else ""
+                        authors.append(f"{ln.text} {fn_text}".strip())
                 papers.append({
                     'id': f"PMID:{pmid}", 'title': title, 'authors': authors,
                     'summary': summary, 'published': f"{year}-01-01",
@@ -319,14 +384,13 @@ class MultiSourceScraper:
                     'source': 'PubMed', 'journal': journal
                 })
                 pbar.update(1)
-        except Exception as e:
-            print(f"  PubMed error: {e}")
+        except (Timeout, ConnectionError, RequestException) as e:
+            print(f"  PubMed request error: {e}")
         pbar.close()
         return papers
 
     # ── PubMed Central (PMC) ──────────────────────────────────────────────
     def search_pubmedcentral(self, query, max_results=100):
-        """Search PubMed Central for full-text OA papers via E-utilities."""
         papers = []
         pbar = self._pbar(min(max_results, 200), f"PMC:{query[:20]}")
         try:
@@ -339,24 +403,37 @@ class MultiSourceScraper:
                 },
                 timeout=30
             )
-            ids = r.json().get('esearchresult', {}).get('idlist', [])
+            r.raise_for_status()
+            try:
+                search_data = r.json()
+            except json.JSONDecodeError as e:
+                print(f"  PMC JSON parse error: {e}")
+                pbar.close()
+                return []
+            ids = search_data.get('esearchresult', {}).get('idlist', [])
             if not ids:
                 pbar.close()
                 return []
-            time.sleep(0.5)
+            jitter = random.uniform(0, 0.5)
+            time.sleep(0.5 + jitter)
             r2 = self.session.get(
                 "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi",
                 params={'db': 'pmc', 'retmode': 'json', 'id': ','.join(ids[:max_results])},
                 timeout=30
             )
-            summaries = r2.json().get('result', {})
+            try:
+                summaries = r2.json().get('result', {})
+            except json.JSONDecodeError as e:
+                print(f"  PMC summary JSON parse error: {e}")
+                pbar.close()
+                return []
             for pmcid in ids[:max_results]:
-                if pmcid not in summaries:
+                s = summaries.get(pmcid)
+                if s is None or not isinstance(s, dict):
                     continue
-                s = summaries[pmcid]
-                title = s.get('title', 'No title')
-                authors = [a.get('name', '') for a in s.get('authors', [])]
-                abstract = s.get('abstract', '') or ""
+                title = s.get('title', 'No title') or 'No title'
+                authors = [a.get('name', '') for a in s.get('authors', []) if isinstance(a, dict)]
+                abstract = s.get('abstract') or ""
                 pub_date = s.get('pubdate', s.get('sortpubdate', ''))
                 pdf_url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/PMC{pmcid}/pdf/"
                 papers.append({
@@ -372,8 +449,8 @@ class MultiSourceScraper:
                     'pmcid': pmcid,
                 })
                 pbar.update(1)
-        except Exception as e:
-            print(f"  PMC error: {e}")
+        except (Timeout, ConnectionError, RequestException) as e:
+            print(f"  PMC request error: {e}")
         pbar.close()
         return papers
 
@@ -388,27 +465,35 @@ class MultiSourceScraper:
                         'fields': 'title,authors,abstract,url,publicationDate,year,venue,openAccessPdf'},
                 timeout=30
             )
-            if r.status_code == 200:
+            if r.status_code != 200:
+                print(f"  Semantic Scholar HTTP {r.status_code}")
+                pbar.close()
+                return []
+            try:
                 data = r.json()
-                for p in data.get('data', []):
-                    paper_dict = {
-                        'id': p.get('paperId', 'unknown'),
-                        'title': p.get('title', ''),
-                        'authors': [a.get('name', '') for a in p.get('authors', [])],
-                        'summary': p.get('abstract', '') or '',
-                        'published': p.get('publicationDate', '') or f"{p.get('year', 2024)}-01-01",
-                        'pdf_url': p.get('url', '') or '',
-                        'source': 'SemanticScholar',
-                        'venue': p.get('venue', '')
-                    }
-                    oa_pdf = p.get('openAccessPdf')
-                    if oa_pdf and oa_pdf.get('url'):
-                        paper_dict['pdf_url'] = oa_pdf['url']
-                        paper_dict['pdf_source'] = 'semanticscholar_oa'
-                    papers.append(paper_dict)
-                    pbar.update(1)
-        except Exception as e:
-            print(f"  SS error: {e}")
+            except json.JSONDecodeError as e:
+                print(f"  Semantic Scholar JSON parse error: {e}")
+                pbar.close()
+                return []
+            for p in data.get('data', []):
+                paper_dict = {
+                    'id': p.get('paperId', 'unknown'),
+                    'title': p.get('title', '') or '',
+                    'authors': [a.get('name', '') for a in p.get('authors', []) if isinstance(a, dict)],
+                    'summary': p.get('abstract') or '',
+                    'published': p.get('publicationDate') or f"{p.get('year', 2024)}-01-01",
+                    'pdf_url': p.get('url') or '',
+                    'source': 'SemanticScholar',
+                    'venue': p.get('venue', '')
+                }
+                oa_pdf = p.get('openAccessPdf')
+                if oa_pdf and isinstance(oa_pdf, dict) and oa_pdf.get('url'):
+                    paper_dict['pdf_url'] = oa_pdf['url']
+                    paper_dict['pdf_source'] = 'semanticscholar_oa'
+                papers.append(paper_dict)
+                pbar.update(1)
+        except (Timeout, ConnectionError, RequestException) as e:
+            print(f"  Semantic Scholar request error: {e}")
         pbar.close()
         return papers
 
@@ -423,32 +508,45 @@ class MultiSourceScraper:
                         'filter': 'type:journal-article'},
                 timeout=30
             )
-            if r.status_code == 200:
-                items = r.json().get('message', {}).get('items', [])
-                for item in items:
-                    title_list = item.get('title', [])
-                    title = title_list[0] if title_list else "No title"
-                    authors = []
-                    for a in item.get('author', []):
-                        name = f"{a.get('given', '')} {a.get('family', '')}".strip()
-                        if name:
-                            authors.append(name)
-                    abstract = item.get('abstract', '') or ""
-                    abstract = re.sub(r'<[^>]+>', '', abstract)
-                    pub_date = item.get('published-print', item.get('published-online', {}))
-                    date_parts = pub_date.get('date-parts', [[2024]])
-                    year = date_parts[0][0] if date_parts else 2024
-                    doi = item.get('DOI', '')
-                    papers.append({
-                        'id': f"DOI:{doi}", 'title': title, 'authors': authors,
-                        'summary': abstract, 'published': f"{year}-01-01",
-                        'pdf_url': f"https://doi.org/{doi}",
-                        'source': 'CrossRef',
-                        'journal': item.get('container-title', [''])[0] if item.get('container-title') else ''
-                    })
-                    pbar.update(1)
-        except Exception as e:
-            print(f"  CrossRef error: {e}")
+            if r.status_code != 200:
+                print(f"  CrossRef HTTP {r.status_code}")
+                pbar.close()
+                return []
+            try:
+                data = r.json()
+            except json.JSONDecodeError as e:
+                print(f"  CrossRef JSON parse error: {e}")
+                pbar.close()
+                return []
+            items = data.get('message', {}).get('items', [])
+            for item in items:
+                title_list = item.get('title', [])
+                title = title_list[0] if title_list else "No title"
+                authors = []
+                for a in item.get('author', []):
+                    if not isinstance(a, dict):
+                        continue
+                    name = f"{a.get('given', '')} {a.get('family', '')}".strip()
+                    if name:
+                        authors.append(name)
+                abstract = item.get('abstract') or ""
+                abstract = re.sub(r'<[^>]+>', '', abstract)
+                pub_date = item.get('published-print', item.get('published-online', {}))
+                if not isinstance(pub_date, dict):
+                    pub_date = {}
+                date_parts = pub_date.get('date-parts', [[2024]])
+                year = date_parts[0][0] if date_parts and len(date_parts[0]) > 0 else 2024
+                doi = item.get('DOI', '')
+                papers.append({
+                    'id': f"DOI:{doi}", 'title': title, 'authors': authors,
+                    'summary': abstract, 'published': f"{year}-01-01",
+                    'pdf_url': f"https://doi.org/{doi}",
+                    'source': 'CrossRef',
+                    'journal': item.get('container-title', [''])[0] if item.get('container-title') else ''
+                })
+                pbar.update(1)
+        except (Timeout, ConnectionError, RequestException) as e:
+            print(f"  CrossRef request error: {e}")
         pbar.close()
         return papers
 
@@ -467,47 +565,58 @@ class MultiSourceScraper:
                 },
                 timeout=30
             )
-            if r.status_code == 200:
-                items = r.json().get('results', [])
-                for item in items:
-                    doi = item.get('doi') or ''
-                    if doi:
-                        doi = doi.replace('https://doi.org/', '')
-                    title = item.get('title') or 'No title'
-                    authors = []
-                    for a in item.get('authorships', [])[:20]:
-                        author = a.get('author', {})
+            if r.status_code != 200:
+                print(f"  OpenAlex HTTP {r.status_code}")
+                pbar.close()
+                return []
+            try:
+                data = r.json()
+            except json.JSONDecodeError as e:
+                print(f"  OpenAlex JSON parse error: {e}")
+                pbar.close()
+                return []
+            items = data.get('results', [])
+            for item in items:
+                doi = item.get('doi') or ''
+                if doi:
+                    doi = doi.replace('https://doi.org/', '')
+                title = item.get('title') or 'No title'
+                authors = []
+                for a in item.get('authorships', [])[:20]:
+                    if not isinstance(a, dict):
+                        continue
+                    author = a.get('author', {})
+                    if isinstance(author, dict):
                         name = author.get('display_name') or ''
                         if name:
                             authors.append(name)
-                    abstract = self._openalex_abstract(item.get('abstract_inverted_index'))
-                    pub_date = item.get('publication_date') or f"{item.get('publication_year') or 2024}-01-01"
-                    pdf_url = ''
-                    if item.get('primary_location'):
-                        pdf_url = item['primary_location'].get('landing_page_url') or ''
-                    if not pdf_url and item.get('locations'):
-                        for loc in item.get('locations', []):
-                            if loc.get('pdf_url'):
-                                pdf_url = loc.get('pdf_url')
-                                break
-                    papers.append({
-                        'id': f"OpenAlex:{item.get('id', '').split('/')[-1]}:{doi}" if doi else f"OpenAlex:{item.get('id', '').split('/')[-1]}",
-                        'title': title, 'authors': authors,
-                        'summary': abstract, 'published': pub_date,
-                        'pdf_url': pdf_url,
-                        'source': 'OpenAlex',
-                        'journal': item.get('host_venue', {}).get('display_name') if item.get('host_venue') else '',
-                        'type': item.get('type', '')
-                    })
-                    pbar.update(1)
-        except Exception as e:
-            print(f"  OpenAlex error: {e}")
+                abstract = self._openalex_abstract(item.get('abstract_inverted_index'))
+                pub_date = item.get('publication_date') or f"{item.get('publication_year') or 2024}-01-01"
+                pdf_url = ''
+                if item.get('primary_location') and isinstance(item['primary_location'], dict):
+                    pdf_url = item['primary_location'].get('landing_page_url') or ''
+                if not pdf_url and item.get('locations'):
+                    for loc in item.get('locations', []):
+                        if isinstance(loc, dict) and loc.get('pdf_url'):
+                            pdf_url = loc.get('pdf_url')
+                            break
+                papers.append({
+                    'id': f"OpenAlex:{item.get('id', '').split('/')[-1]}:{doi}" if doi else f"OpenAlex:{item.get('id', '').split('/')[-1]}",
+                    'title': title, 'authors': authors,
+                    'summary': abstract, 'published': pub_date,
+                    'pdf_url': pdf_url,
+                    'source': 'OpenAlex',
+                    'journal': item.get('host_venue', {}).get('display_name') if item.get('host_venue') else '',
+                    'type': item.get('type', '')
+                })
+                pbar.update(1)
+        except (Timeout, ConnectionError, RequestException) as e:
+            print(f"  OpenAlex request error: {e}")
         pbar.close()
         return papers
 
     # ── bioRxiv ─────────────────────────────────────────────────────────────
     def search_biorxiv(self, query, max_results=100):
-        """Search bioRxiv via their API."""
         papers = []
         pbar = self._pbar(min(max_results, 100), f"bioRxiv:{query[:20]}")
         try:
@@ -516,29 +625,36 @@ class MultiSourceScraper:
                 params={'q': query, 'num_results': min(max_results, 100)},
                 timeout=30
             )
-            if r.status_code == 200:
+            if r.status_code != 200:
+                print(f"  bioRxiv HTTP {r.status_code}")
+                pbar.close()
+                return []
+            try:
                 data = r.json()
-                for item in data.get('collection', [])[:max_results]:
-                    papers.append({
-                        'id': f"bioRxiv:{item.get('doi', '')}",
-                        'title': item.get('title', ''),
-                        'authors': [a.strip() for a in item.get('authors', '').split(';') if a.strip()],
-                        'summary': item.get('abstract', ''),
-                        'published': item.get('date', ''),
-                        'pdf_url': f"https://www.biorxiv.org/content/{item.get('doi', '')}.full.pdf" if item.get('doi') else '',
-                        'pdf_source': 'biorxiv',
-                        'source': 'bioRxiv',
-                        'doi': item.get('doi', ''),
-                    })
-                    pbar.update(1)
-        except Exception as e:
-            print(f"  bioRxiv error: {e}")
+            except json.JSONDecodeError as e:
+                print(f"  bioRxiv JSON parse error: {e}")
+                pbar.close()
+                return []
+            for item in data.get('collection', [])[:max_results]:
+                papers.append({
+                    'id': f"bioRxiv:{item.get('doi', '')}",
+                    'title': item.get('title', ''),
+                    'authors': [a.strip() for a in item.get('authors', '').split(';') if a.strip()],
+                    'summary': item.get('abstract', ''),
+                    'published': item.get('date', ''),
+                    'pdf_url': f"https://www.biorxiv.org/content/{item.get('doi', '')}.full.pdf" if item.get('doi') else '',
+                    'pdf_source': 'biorxiv',
+                    'source': 'bioRxiv',
+                    'doi': item.get('doi', ''),
+                })
+                pbar.update(1)
+        except (Timeout, ConnectionError, RequestException) as e:
+            print(f"  bioRxiv request error: {e}")
         pbar.close()
         return papers
 
     # ── PsyArXiv ────────────────────────────────────────────────────────────
     def search_psyarxiv(self, query, max_results=100):
-        """Search PsyArXiv via OSF API."""
         papers = []
         pbar = self._pbar(min(max_results, 100), f"PsyArXiv:{query[:20]}")
         try:
@@ -551,29 +667,42 @@ class MultiSourceScraper:
                 },
                 timeout=30
             )
-            if r.status_code == 200:
+            if r.status_code != 200:
+                print(f"  PsyArXiv HTTP {r.status_code}")
+                pbar.close()
+                return []
+            try:
                 data = r.json()
-                for item in data.get('data', [])[:max_results]:
-                    attrs = item.get('attributes', {})
-                    papers.append({
-                        'id': f"PsyArXiv:{item.get('id', '')}",
-                        'title': attrs.get('title', ''),
-                        'authors': [],
-                        'summary': attrs.get('description', ''),
-                        'published': attrs.get('date_created', ''),
-                        'pdf_url': attrs.get('links', {}).get('download', '') if attrs.get('links') else '',
-                        'pdf_source': 'psyarxiv',
-                        'source': 'PsyArXiv',
-                    })
-                    pbar.update(1)
-        except Exception as e:
-            print(f"  PsyArXiv error: {e}")
+            except json.JSONDecodeError as e:
+                print(f"  PsyArXiv JSON parse error: {e}")
+                pbar.close()
+                return []
+            for item in data.get('data', [])[:max_results]:
+                attrs = item.get('attributes', {})
+                if not isinstance(attrs, dict):
+                    continue
+                pdf_url = ''
+                links = attrs.get('links', {})
+                if isinstance(links, dict):
+                    pdf_url = links.get('download', '')
+                papers.append({
+                    'id': f"PsyArXiv:{item.get('id', '')}",
+                    'title': attrs.get('title', ''),
+                    'authors': [],
+                    'summary': attrs.get('description', ''),
+                    'published': attrs.get('date_created', ''),
+                    'pdf_url': pdf_url,
+                    'pdf_source': 'psyarxiv',
+                    'source': 'PsyArXiv',
+                })
+                pbar.update(1)
+        except (Timeout, ConnectionError, RequestException) as e:
+            print(f"  PsyArXiv request error: {e}")
         pbar.close()
         return papers
 
     # ── OSF Preprints ───────────────────────────────────────────────────────
     def search_osf(self, query, max_results=100):
-        """Search OSF Preprints (all providers)."""
         papers = []
         pbar = self._pbar(min(max_results, 100), f"OSF:{query[:20]}")
         try:
@@ -585,29 +714,42 @@ class MultiSourceScraper:
                 },
                 timeout=30
             )
-            if r.status_code == 200:
+            if r.status_code != 200:
+                print(f"  OSF HTTP {r.status_code}")
+                pbar.close()
+                return []
+            try:
                 data = r.json()
-                for item in data.get('data', [])[:max_results]:
-                    attrs = item.get('attributes', {})
-                    papers.append({
-                        'id': f"OSF:{item.get('id', '')}",
-                        'title': attrs.get('title', ''),
-                        'authors': [],
-                        'summary': attrs.get('description', ''),
-                        'published': attrs.get('date_created', ''),
-                        'pdf_url': attrs.get('links', {}).get('download', '') if attrs.get('links') else '',
-                        'pdf_source': 'osf',
-                        'source': 'OSF',
-                    })
-                    pbar.update(1)
-        except Exception as e:
-            print(f"  OSF error: {e}")
+            except json.JSONDecodeError as e:
+                print(f"  OSF JSON parse error: {e}")
+                pbar.close()
+                return []
+            for item in data.get('data', [])[:max_results]:
+                attrs = item.get('attributes', {})
+                if not isinstance(attrs, dict):
+                    continue
+                pdf_url = ''
+                links = attrs.get('links', {})
+                if isinstance(links, dict):
+                    pdf_url = links.get('download', '')
+                papers.append({
+                    'id': f"OSF:{item.get('id', '')}",
+                    'title': attrs.get('title', ''),
+                    'authors': [],
+                    'summary': attrs.get('description', ''),
+                    'published': attrs.get('date_created', ''),
+                    'pdf_url': pdf_url,
+                    'pdf_source': 'osf',
+                    'source': 'OSF',
+                })
+                pbar.update(1)
+        except (Timeout, ConnectionError, RequestException) as e:
+            print(f"  OSF request error: {e}")
         pbar.close()
         return papers
 
     # ── ResearchGate ────────────────────────────────────────────────────────
     def search_researchgate(self, query, max_results=50):
-        """Search ResearchGate for papers (author-uploaded PDFs)."""
         papers = []
         pbar = self._pbar(min(max_results, 50), f"ResearchGate:{query[:20]}")
         try:
@@ -620,35 +762,37 @@ class MultiSourceScraper:
                     'Accept': 'text/html,application/xhtml+xml',
                 }
             )
-            if r.status_code == 200:
-                html = r.text
-                pub_pattern = re.compile(
-                    r'"publicationType":"([^"]+)".*?"title":"([^"]+)".*?"doi":"([^"]*)".*?"url":"([^"]+)"',
-                    re.DOTALL
-                )
-                for m in pub_pattern.finditer(html):
-                    pub_type, title, doi, url = m.groups()
-                    papers.append({
-                        'id': f"RG:{doi or url.split('/')[-1]}",
-                        'title': title.replace('\\n', ' '),
-                        'authors': [],
-                        'summary': '',
-                        'published': '',
-                        'pdf_url': url if url.endswith('.pdf') else '',
-                        'source': 'ResearchGate',
-                        'doi': doi,
-                    })
-                    pbar.update(1)
-                    if len(papers) >= max_results:
-                        break
-        except Exception as e:
-            print(f"  ResearchGate error: {e}")
+            if r.status_code != 200:
+                print(f"  ResearchGate HTTP {r.status_code}")
+                pbar.close()
+                return []
+            html = r.text
+            pub_pattern = re.compile(
+                r'"publicationType":"([^"]+)".*?"title":"([^"]+)".*?"doi":"([^"]*)".*?"url":"([^"]+)"',
+                re.DOTALL
+            )
+            for m in pub_pattern.finditer(html):
+                pub_type, title, doi, url = m.groups()
+                papers.append({
+                    'id': f"RG:{doi or url.split('/')[-1]}",
+                    'title': title.replace('\\n', ' '),
+                    'authors': [],
+                    'summary': '',
+                    'published': '',
+                    'pdf_url': url if url.endswith('.pdf') else '',
+                    'source': 'ResearchGate',
+                    'doi': doi,
+                })
+                pbar.update(1)
+                if len(papers) >= max_results:
+                    break
+        except (Timeout, ConnectionError, RequestException) as e:
+            print(f"  ResearchGate request error: {e}")
         pbar.close()
         return papers
 
     # ── LibGen (grey literature) ────────────────────────────────────────────────
     def search_libgen(self, query, max_results=50):
-        """Search Library Genesis for behavioural science books and papers."""
         if not HAS_GREY_SOURCES:
             return []
         papers = []
@@ -668,6 +812,8 @@ class MultiSourceScraper:
                     'md5': item.get('md5', ''),
                 })
                 pbar.update(1)
+        except (Timeout, ConnectionError, RequestException) as e:
+            print(f"  LibGen request error: {e}")
         except Exception as e:
             print(f"  LibGen error: {e}")
         pbar.close()
@@ -675,7 +821,6 @@ class MultiSourceScraper:
 
     # ── Anna's Archive (grey literature) ───────────────────────────────────────
     def search_annas_archive(self, query, max_results=50):
-        """Search Anna's Archive for academic papers and books."""
         if not HAS_GREY_SOURCES:
             return []
         papers = []
@@ -695,6 +840,8 @@ class MultiSourceScraper:
                     'md5': item.get('md5', ''),
                 })
                 pbar.update(1)
+        except (Timeout, ConnectionError, RequestException) as e:
+            print(f"  Anna's Archive request error: {e}")
         except Exception as e:
             print(f"  Anna's Archive error: {e}")
         pbar.close()
@@ -709,12 +856,11 @@ class MultiSourceScraper:
                 for pos in positions:
                     words[int(pos)] = word
             return ' '.join(words[i] for i in sorted(words.keys()))
-        except Exception:
+        except (KeyError, ValueError, TypeError, AttributeError):
             return ''
 
     # ── Dedup + save ──────────────────────────────────────────────────────
     def dedup(self, papers):
-        """Dedup by DOI first, then title normalization."""
         seen_dois = set()
         seen_titles = {}
         unique = []
@@ -725,7 +871,7 @@ class MultiSourceScraper:
                 if doi_norm in seen_dois:
                     continue
                 seen_dois.add(doi_norm)
-            key = re.sub(r'[^\w]', '', p['title'].lower())[:100]
+            key = re.sub(r'[^\w]', '', (p.get('title') or '').lower())[:100]
             if key and key in seen_titles:
                 continue
             if key:
@@ -738,7 +884,6 @@ class MultiSourceScraper:
         out = self.data_dir / f"papers_{tag}_{ts}.json"
         with open(out, 'w', encoding='utf-8') as f:
             json.dump(papers, f, indent=2, ensure_ascii=False)
-        # Also copy as canonical
         canonical = self.data_dir / f"papers_{tag}.json"
         if canonical.exists():
             os.remove(canonical)
@@ -747,7 +892,6 @@ class MultiSourceScraper:
 
     # ── Run all queries ───────────────────────────────────────────────────
     def run_all(self, queries, sources=None, max_per_query=50, incremental=False):
-        """Run a dict of queries across multiple sources."""
         if sources is None:
             sources = ['arxiv', 'pubmed', 'semanticscholar', 'crossref', 'openalex']
         existing_ids = set()
@@ -757,43 +901,7 @@ class MultiSourceScraper:
         all_papers = []
         for qname, qtext in queries.items():
             print(f"\n[{qname}]")
-            batch = []
-            if 'arxiv' in sources:
-                print(f"  arXiv...")
-                batch.extend(self.search_arxiv(qtext, max_per_query))
-            if 'pubmed' in sources:
-                print(f"  PubMed...")
-                batch.extend(self.search_pubmed(qtext, max_per_query))
-            if 'pubmedcentral' in sources:
-                print(f"  PubMed Central...")
-                batch.extend(self.search_pubmedcentral(qtext, max_per_query))
-            if 'semanticscholar' in sources:
-                print(f"  Semantic Scholar...")
-                batch.extend(self.search_semanticscholar(qtext, max_per_query))
-            if 'crossref' in sources:
-                print(f"  CrossRef...")
-                batch.extend(self.search_crossref(qtext, max_per_query))
-            if 'openalex' in sources:
-                print(f"  OpenAlex...")
-                batch.extend(self.search_openalex(qtext, max_per_query))
-            if 'biorxiv' in sources:
-                print(f"  bioRxiv...")
-                batch.extend(self.search_biorxiv(qtext, max_per_query))
-            if 'psyarxiv' in sources:
-                print(f"  PsyArXiv...")
-                batch.extend(self.search_psyarxiv(qtext, max_per_query))
-            if 'osf' in sources:
-                print(f"  OSF...")
-                batch.extend(self.search_osf(qtext, max_per_query))
-            if 'researchgate' in sources:
-                print(f"  ResearchGate...")
-                batch.extend(self.search_researchgate(qtext, max_per_query))
-            if 'libgen' in sources:
-                print(f"  LibGen...")
-                batch.extend(self.search_libgen(qtext, max_per_query))
-            if 'annas' in sources:
-                print(f"  Anna's Archive...")
-                batch.extend(self.search_annas_archive(qtext, max_per_query))
+            batch = self._search_all_sources(qtext, sources, max_per_query)
             if incremental:
                 filtered = [p for p in batch
                             if (p.get("id") not in existing_ids)
@@ -846,7 +954,6 @@ if __name__ == "__main__":
     sources = [s.strip() for s in args.sources.split(',') if s.strip()]
     all_papers = []
     selected_group = None
-    selected_queries = None
     mode_label = ''
 
     GROUP_ALIASES = {
@@ -899,32 +1006,13 @@ if __name__ == "__main__":
         selected_group = 'custom key'
         qtext = ALL_QUERIES.get(args.query, args.query)
         mode_label = f'query: {args.query}'
-        if 'arxiv' in sources:
-            all_papers.extend(scraper.search_arxiv(qtext, args.num))
-        if 'pubmed' in sources:
-            all_papers.extend(scraper.search_pubmed(qtext, args.num))
-        if 'semanticscholar' in sources:
-            all_papers.extend(scraper.search_semanticscholar(qtext, args.num))
-        if 'crossref' in sources:
-            all_papers.extend(scraper.search_crossref(qtext, args.num))
-        if 'openalex' in sources:
-            all_papers.extend(scraper.search_openalex(qtext, args.num))
+        all_papers = scraper._search_all_sources(qtext, sources, args.num)
     elif args.custom:
         selected_group = 'custom'
         qtext = args.custom
         mode_label = 'custom query'
-        # For arXiv, wrap plain text in all:"..."
         arxiv_q = f'all:"{qtext}"'
-        if 'arxiv' in sources:
-            all_papers.extend(scraper.search_arxiv(arxiv_q, args.num))
-        if 'pubmed' in sources:
-            all_papers.extend(scraper.search_pubmed(qtext, args.num))
-        if 'semanticscholar' in sources:
-            all_papers.extend(scraper.search_semanticscholar(qtext, args.num))
-        if 'crossref' in sources:
-            all_papers.extend(scraper.search_crossref(qtext, args.num))
-        if 'openalex' in sources:
-            all_papers.extend(scraper.search_openalex(qtext, args.num))
+        all_papers = scraper._search_all_sources(qtext, sources, args.num, arxiv_query=arxiv_q)
     else:
         print("Available query groups:")
         for group, queries in ALL_QUERY_GROUPS.items():
