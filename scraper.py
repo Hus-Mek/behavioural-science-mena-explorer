@@ -1,8 +1,8 @@
 """
 Multi-source scraper for behavioural science papers with MENA focus.
-Targets: arXiv, PubMed, Semantic Scholar, CrossRef.
+Targets: arXiv, PubMed, Semantic Scholar, CrossRef, OpenAlex, bioRxiv, PsyArXiv, OSF, ResearchGate, LibGen, Anna's Archive.
 Covers: behavioural models (COM-B, TPB, HBM, SCT, SDT, etc.),
-          Arabic/MENA regional terms, broad behavioural science.
+          Arabic/MENA regional terms, broad behavioural science, grey literature.
 """
 import requests
 import xml.etree.ElementTree as ET
@@ -14,6 +14,12 @@ import argparse
 import shutil
 from pathlib import Path
 from collections import Counter
+
+try:
+    from grey_sources import libgen_search, annas_archive_search
+    HAS_GREY_SOURCES = True
+except ImportError:
+    HAS_GREY_SOURCES = False
 
 try:
     from tqdm import tqdm
@@ -640,6 +646,60 @@ class MultiSourceScraper:
         pbar.close()
         return papers
 
+    # ── LibGen (grey literature) ────────────────────────────────────────────────
+    def search_libgen(self, query, max_results=50):
+        """Search Library Genesis for behavioural science books and papers."""
+        if not HAS_GREY_SOURCES:
+            return []
+        papers = []
+        pbar = self._pbar(min(max_results, 50), f"LibGen:{query[:20]}")
+        try:
+            results = libgen_search(query, max_results)
+            for item in results:
+                papers.append({
+                    'id': f"LibGen:{item.get('md5', '')[:16]}",
+                    'title': item.get('title', ''),
+                    'authors': item.get('authors', '').split(';') if item.get('authors') else [],
+                    'summary': '',
+                    'published': '',
+                    'pdf_url': item.get('download_url', ''),
+                    'pdf_source': 'libgen',
+                    'source': 'LibGen',
+                    'md5': item.get('md5', ''),
+                })
+                pbar.update(1)
+        except Exception as e:
+            print(f"  LibGen error: {e}")
+        pbar.close()
+        return papers
+
+    # ── Anna's Archive (grey literature) ───────────────────────────────────────
+    def search_annas_archive(self, query, max_results=50):
+        """Search Anna's Archive for academic papers and books."""
+        if not HAS_GREY_SOURCES:
+            return []
+        papers = []
+        pbar = self._pbar(min(max_results, 50), f"Anna:{query[:20]}")
+        try:
+            results = annas_archive_search(query, max_results)
+            for item in results:
+                papers.append({
+                    'id': f"Anna:{item.get('md5', '')[:16]}",
+                    'title': item.get('title', ''),
+                    'authors': [],
+                    'summary': '',
+                    'published': '',
+                    'pdf_url': item.get('download_url', ''),
+                    'pdf_source': 'annas',
+                    'source': 'AnnaArchive',
+                    'md5': item.get('md5', ''),
+                })
+                pbar.update(1)
+        except Exception as e:
+            print(f"  Anna's Archive error: {e}")
+        pbar.close()
+        return papers
+
     def _openalex_abstract(self, inverted):
         if not inverted:
             return ''
@@ -728,6 +788,12 @@ class MultiSourceScraper:
             if 'researchgate' in sources:
                 print(f"  ResearchGate...")
                 batch.extend(self.search_researchgate(qtext, max_per_query))
+            if 'libgen' in sources:
+                print(f"  LibGen...")
+                batch.extend(self.search_libgen(qtext, max_per_query))
+            if 'annas' in sources:
+                print(f"  Anna's Archive...")
+                batch.extend(self.search_annas_archive(qtext, max_per_query))
             if incremental:
                 filtered = [p for p in batch
                             if (p.get("id") not in existing_ids)
@@ -765,8 +831,8 @@ if __name__ == "__main__":
     parser.add_argument('--tag', default=None, help='Output tag; defaults to query/group/custom')
     parser.add_argument('--delay', type=float, default=3, help='Delay between arXiv requests')
     parser.add_argument('-n', '--num', type=int, default=50, help='Max results per query')
-    parser.add_argument('--sources', default='arxiv,pubmed,pubmedcentral,semanticscholar,crossref,openalex,biorxiv,psyarxiv,osf,researchgate',
-                        help='Comma-separated sources')
+    parser.add_argument('--sources', default='arxiv,pubmed,pubmedcentral,semanticscholar,crossref,openalex,biorxiv,psyarxiv,osf,researchgate,libgen,annas',
+                        help='Comma-separated sources (includes grey: libgen, annas)')
     parser.add_argument('--all-models', action='store_true', help='Run ALL behavioural model queries')
     parser.add_argument('--all-mena', action='store_true', help='Run ALL MENA queries')
     parser.add_argument('--all-combined', action='store_true', help='Run ALL combined queries')

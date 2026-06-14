@@ -11,6 +11,7 @@ import csv
 import io
 import time
 import hashlib
+import tempfile
 from pathlib import Path
 from datetime import datetime
 from collections import Counter
@@ -551,6 +552,8 @@ def _run_batch_job(job_id, papers):
                 "title": paper.get("title"),
                 "analysis": {"error": str(e)}
             })
+            with batch_jobs_lock:
+                batch_jobs[job_id]["error"] = str(e)
         with batch_jobs_lock:
             batch_jobs[job_id]["progress"] = i + 1
             batch_jobs[job_id]["results"] = results
@@ -1094,7 +1097,7 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_error(404)
 
         except Exception as e:
-            with open('/tmp/server_errors.log', 'a') as ef:
+            with open(os.path.join(tempfile.gettempdir(), 'server_errors.log'), 'a') as ef:
                 ef.write(f"[{datetime.now().isoformat()}] GET {self.path} ERROR: {type(e).__name__}: {e}\n")
             self._json({"error": f"Internal error: {str(e)}"}, status=500)
 
@@ -1102,7 +1105,7 @@ class Handler(SimpleHTTPRequestHandler):
 
     def _handle_export(self, params):
         """Export papers in CSV, BibTeX, or JSON format."""
-        _err = open('/tmp/export_debug.log', 'w')
+        _err = open(os.path.join(tempfile.gettempdir(), 'export_debug.log'), 'w')
         try:
             fmt = params.get("format", ["csv"])[0].lower()
             _err.write(f"format={fmt}\n")
@@ -1151,28 +1154,26 @@ class Handler(SimpleHTTPRequestHandler):
                 ct = "application/x-bibtex"
                 ext = "bib"
             else:  # csv
-                rows = []
-                header = ["id", "title", "authors", "year", "abstract", "url"]
-                rows.append("|".join(header))
-                for p in result:
-                    pid = str(p.get("id") or p.get("entry_id") or "")
-                    title = (p.get("title") or "").replace("\\n", " ").replace("\\r", " ")
-                    authors = "; ".join(p.get("authors") or [])
-                    year = ""
-                    pub = p.get("published", "")
-                    if pub:
-                        try:
-                            year = str(datetime.fromisoformat(pub.replace("Z", "+00:00")).year)
-                        except Exception:
-                            year = pub[:4]
-                    abstract = (p.get("summary") or "").replace("\\n", " ").replace("\\r", " ")
-                    url = p.get("url", "")
-                    fields = [pid, title, authors, year, abstract, url]
-                    esc_fields = [f.replace("|", "\\|") if isinstance(f, str) else str(f) for f in fields]
-                    rows.append("|".join(esc_fields))
-                body = "\\n".join(rows).encode("utf-8")
-                ct = "text/csv"
-                ext = "csv"
+                 output = io.StringIO()
+                 writer = csv.writer(output)
+                 writer.writerow(["id", "title", "authors", "year", "abstract", "url"])
+                 for p in result:
+                     pid = str(p.get("id") or p.get("entry_id") or "")
+                     title = (p.get("title") or "").replace("\n", " ").replace("\r", " ")
+                     authors = "; ".join(p.get("authors") or [])
+                     year = ""
+                     pub = p.get("published", "")
+                     if pub:
+                         try:
+                             year = str(datetime.fromisoformat(pub.replace("Z", "+00:00")).year)
+                         except Exception:
+                             year = pub[:4]
+                     abstract = (p.get("summary") or "").replace("\n", " ").replace("\r", " ")
+                     url = p.get("url", "")
+                     writer.writerow([pid, title, authors, year, abstract, url])
+                 body = output.getvalue().encode("utf-8")
+                 ct = "text/csv"
+                 ext = "csv"
 
             fname = "papers_export_{0}_{1}.{2}".format(
                 len(result),
@@ -1234,7 +1235,8 @@ class Handler(SimpleHTTPRequestHandler):
                 scored = []
                 for p in papers_global:
                     text = ((p.get('title') or '') + ' ' + (p.get('summary') or '')).lower()
-                    score = 3 if query_phrases[0] in text else 0
+                    phrase_pattern = r'\b' + _re.escape(query_phrases[0]) + r'\b'
+                    score = 3 if _re.search(phrase_pattern, text) else 0
                     score += sum(1 for w in query_words if w in text)
                     if score > 0:
                         scored.append((score, p))

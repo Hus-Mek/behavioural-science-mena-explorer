@@ -1,8 +1,3 @@
-# No external dependencies required - uses only Python stdlib
-# Optional dependencies for enhanced functionality:
-#   pymupdf>=1.24.0        - fast PDF extraction
-#   pdfplumber>=0.11.0     - alternative PDF extraction
-#   docling>=2.0.0         - high-accuracy PDF extraction (large dep)
-#   requests>=2.31.0       - required by scraper.py
-#   beautifulsoup4>=4.12.0 - HTML parsing for grey sources
-# This file is kept for Docker/pip compatibility
+flask>=3.1.0
+numpy>=1.24.0
+requests>=2.31.0
