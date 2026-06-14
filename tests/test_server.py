@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 os.environ["OPENROUTER_API_KEY"] = "test-key-dummy"
 
 import server
+import scraper
 
 
 def make_papers(tmp_path, papers_data, filename="papers_test.json"):
@@ -347,6 +348,127 @@ class TestBatchJobs:
         # Clean up
         with server.batch_jobs_lock:
             del server.batch_jobs[job_id]
+
+
+# ── DOI Dedup ────────────────────────────────────────────────────────────────
+
+class TestDOIDedup:
+    def test_dedup_by_doi(self):
+        s = scraper.MultiSourceScraper()
+        papers = [
+            {"id": "a.001", "title": "Paper A", "summary": "x", "doi": "10.1234/abc"},
+            {"id": "b.002", "title": "Paper B", "summary": "y", "doi": "10.1234/abc"},
+            {"id": "c.003", "title": "Paper C", "summary": "z", "doi": "10.5678/def"},
+        ]
+        result = s.dedup(papers)
+        dois = [p.get("doi") for p in result]
+        assert dois.count("10.1234/abc") == 1
+        assert len(result) == 2
+
+    def test_dedup_by_doi_normalizes(self):
+        s = scraper.MultiSourceScraper()
+        papers = [
+            {"id": "a.001", "title": "Paper A", "summary": "x", "doi": "https://doi.org/10.1234/ABC"},
+            {"id": "b.002", "title": "Paper B", "summary": "y", "doi": "10.1234/abc"},
+        ]
+        result = s.dedup(papers)
+        assert len(result) == 1
+
+    def test_dedup_by_doi_with_url_prefix(self):
+        s = scraper.MultiSourceScraper()
+        papers = [
+            {"id": "a.001", "title": "Paper A", "summary": "x", "DOI": "doi:10.1234/xyz"},
+            {"id": "b.002", "title": "Paper B", "summary": "y", "DOI": "10.1234/xyz"},
+        ]
+        result = s.dedup(papers)
+        assert len(result) == 1
+
+
+# ── Fulltext ─────────────────────────────────────────────────────────────────
+
+class TestFulltext:
+    def test_get_paper_full_text_returns_abstract_when_no_pdf(self, tmp_path):
+        """When no PDF available, should return abstract."""
+        papers = [
+            {"id": "ft.001", "title": "Test Paper", "summary": "This is the abstract", "pdf_url": ""},
+        ]
+        make_papers(tmp_path, papers)
+        text = server.get_paper_full_text(papers[0])
+        assert isinstance(text, str)
+        assert len(text) > 0
+
+    def test_get_paper_full_text_caching(self, tmp_path):
+        """Extracted text should be cached to disk."""
+        papers = [
+            {"id": "ft.002", "title": "Cached Paper", "summary": "Abstract text", "pdf_url": ""},
+        ]
+        make_papers(tmp_path, papers)
+        text = server.get_paper_full_text(papers[0])
+        assert isinstance(text, str)
+
+
+# ── Incremental Mode ─────────────────────────────────────────────────────────
+
+class TestIncrementalMode:
+    def test_load_existing_ids(self, tmp_path):
+        """load_existing_ids should find IDs from existing files."""
+        raw_dir = tmp_path / "data" / "raw"
+        raw_dir.mkdir(parents=True)
+        existing = [
+            {"id": "ex.001", "title": "Existing", "summary": "x", "doi": "10.1234/ex"},
+            {"id": "ex.002", "title": "Existing 2", "summary": "y"},
+        ]
+        with open(raw_dir / "papers_existing.json", "w") as f:
+            json.dump(existing, f)
+        ids = scraper.load_existing_ids(raw_dir)
+        assert "ex.001" in ids
+        assert "ex.002" in ids
+        assert "DOI:10.1234/ex" in ids
+
+
+# ── Enrichment ───────────────────────────────────────────────────────────────
+
+class TestEnrichment:
+    def test_normalize_doi(self):
+        """DOI normalization should handle various formats."""
+        from enrichment import _normalize_doi
+        assert _normalize_doi("10.1234/ABC") == "10.1234/abc"
+        assert _normalize_doi("https://doi.org/10.1234/abc") == "10.1234/abc"
+        assert _normalize_doi("doi:10.1234/abc") == "10.1234/abc"
+        assert _normalize_doi("") == ""
+
+    def test_dedup_by_doi(self):
+        """dedup_by_doi should remove duplicate DOIs."""
+        from enrichment import dedup_by_doi
+        papers = [
+            {"id": "a", "doi": "10.1234/abc"},
+            {"id": "b", "doi": "10.1234/abc"},
+            {"id": "c", "doi": "10.5678/def"},
+        ]
+        result = dedup_by_doi(papers)
+        assert len(result) == 2
+
+
+# ── Grey Sources (import check) ───────────────────────────────────────────────
+
+class TestGreySourcesImport:
+    def test_scihub_import(self):
+        """Sci-Hub module should import without errors."""
+        from grey_sources import scihub_download, SCIHUB_MIRRORS
+        assert isinstance(SCIHUB_MIRRORS, list)
+        assert len(SCIHUB_MIRRORS) > 0
+
+    def test_libgen_import(self):
+        """LibGen module should import without errors."""
+        from grey_sources import libgen_search, libgen_download
+        assert callable(libgen_search)
+        assert callable(libgen_download)
+
+    def test_annas_archive_import(self):
+        """Anna's Archive module should import without errors."""
+        from grey_sources import annas_archive_search, annas_archive_download
+        assert callable(annas_archive_search)
+        assert callable(annas_archive_download)
 
 
 if __name__ == "__main__":

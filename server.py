@@ -16,6 +16,24 @@ from datetime import datetime
 from collections import Counter
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 
+# Optional third‑party PDF extractor – Docling. If unavailable we gracefully skip it.
+try:
+    from docling.document_converter import DocumentConverter  # type: ignore
+except Exception:  # pragma: no cover
+    DocumentConverter = None  # noqa: N806
+
+# Enrichment utilities for Unpaywall (standard‑library implementation).
+try:
+    from enrichment import enrich_unpaywall  # noqa: F401
+except Exception:  # pragma: no cover
+    enrich_unpaywall = None  # type: ignore
+
+# Sci‑Hub fallback downloader (grey literature source).
+try:
+    from grey_sources.scihub import scihub_download  # noqa: F401
+except Exception:  # pragma: no cover
+    scihub_download = None  # type: ignore
+
 # ── Rate Limiter ─────────────────────────────────────────────────────────────
 class RateLimiter:
     """Thread-safe token-bucket rate limiter."""
@@ -109,7 +127,21 @@ PDF_DIR = ROOT / "data" / "pdfs"
 PDF_DIR.mkdir(parents=True, exist_ok=True)
 
 def extract_pdf_text(pdf_path):
-    """Extract text from a PDF file. Returns plain text or error string."""
+    """Extract text from a PDF file. Returns plain text or error string.
+    Chain: Docling → PyMuPDF (fitz) → pdfplumber → pdftotext CLI.
+    Docling is optional; if unavailable, the chain falls back.
+    """
+    # --- Docling extractor (optional) ---
+    if DocumentConverter is not None:
+        try:
+            converter = DocumentConverter()
+            result = converter.convert(str(pdf_path))
+            text = result.document.export_to_markdown()
+            if len(text.strip()) > 100:
+                return text.strip()
+        except Exception:
+            pass
+    # --- PyMuPDF extractor ---
     try:
         import fitz  # pymupdf
         doc = fitz.open(pdf_path)
@@ -117,24 +149,26 @@ def extract_pdf_text(pdf_path):
         for page in doc:
             text += page.get_text()
         doc.close()
-        return text.strip()
+        if text.strip():
+            return text.strip()
     except ImportError:
         pass
-    except Exception as e:
-        return f"[PDF extraction error: {e}]"
-
+    except Exception:
+        pass
+    # --- pdfplumber extractor ---
     try:
         import pdfplumber
         text = ""
         with pdfplumber.open(pdf_path) as pdf:
             for page in pdf.pages:
                 text += (page.extract_text() or "") + "\n"
-        return text.strip()
+        if text.strip():
+            return text.strip()
     except ImportError:
         pass
-    except Exception as e:
-        return f"[PDF extraction error: {e}]"
-
+    except Exception:
+        pass
+    # --- pdftotext CLI extractor ---
     try:
         result = subprocess.run(
             ["pdftotext", "-layout", str(pdf_path), "-"],
@@ -166,26 +200,69 @@ def download_pdf(url, paper_id):
         print(f"  PDF download failed for {paper_id}: {e}")
         return None
 
-def get_paper_full_text(paper):
-    """Get full text for a paper: try PDF extraction, fall back to abstract."""
+def download_pdf_with_fallback(paper, paper_id, grey=False):
+    """Download a PDF for *paper* using a fallback chain.
+
+    1️⃣ Direct ``pdf_url`` (if it ends with ``.pdf``)
+    2️⃣ Unpaywall (if DOI present and ``enrich_unpaywall`` is available)
+    3️⃣ Sci‑Hub (if ``grey`` is True and ``scihub_download`` is available)
+
+    Returns a tuple ``(pdf_path, source)`` where *source* is one of ``"direct"``, ``"unpaywall"``,
+    ``"scihub"`` or ``None``. If no PDF could be obtained, both values are ``None``.
+    """
+    # 1. Direct URL
+    pdf_url = paper.get("pdf_url") or paper.get("url", "")
+    if pdf_url and pdf_url.lower().endswith('.pdf'):
+        path = download_pdf(pdf_url, paper_id)
+        if path:
+            return path, "direct"
+
+    # 2. Unpaywall via DOI
+    if enrich_unpaywall:
+        doi = paper.get("doi") or paper.get("DOI")
+        if doi:
+            info = enrich_unpaywall(doi)
+            unpay_pdf = info.get("pdf_url")
+            if unpay_pdf:
+                path = download_pdf(unpay_pdf, paper_id)
+                if path:
+                    return path, "unpaywall"
+
+    # 3. Sci‑Hub (grey literature) – optional
+    if grey and scihub_download:
+        doi = paper.get("doi") or paper.get("DOI")
+        title = paper.get("title")
+        path = scihub_download(doi=doi, title=title, paper_id=paper_id, pdf_dir=PDF_DIR)
+        if path:
+            return path, "scihub"
+
+    return None, None
+
+
+def get_paper_full_text(paper, grey=False):
+    """Get full text for a paper: try PDF extraction (with fallback), otherwise abstract.
+
+    The extracted full text is cached under ``PDF_DIR/<safe_id>.txt`` for future reuse.
+    """
     paper_id = paper.get("id") or paper.get("entry_id") or ""
-    cache_path = PDF_DIR / f"{paper_id}.txt"
+    safe_id = re.sub(r'[^a-zA-Z0-9._-]', '_', str(paper_id))
+    cache_path = PDF_DIR / f"{safe_id}.txt"
     if cache_path.exists():
         try:
             return cache_path.read_text(encoding="utf-8")
         except Exception:
             pass
-    pdf_url = paper.get("pdf_url") or paper.get("url", "")
-    if pdf_url and pdf_url.endswith(".pdf"):
-        pdf_path = download_pdf(pdf_url, paper_id)
-        if pdf_path:
-            text = extract_pdf_text(pdf_path)
-            if text and not text.startswith("["):
-                try:
-                    cache_path.write_text(text, encoding="utf-8")
-                except Exception:
-                    pass
-            return text
+
+    pdf_path, source = download_pdf_with_fallback(paper, safe_id, grey=grey)
+    if pdf_path:
+        text = extract_pdf_text(pdf_path)
+        if text and not text.startswith("["):
+            try:
+                cache_path.write_text(text, encoding="utf-8")
+            except Exception:
+                pass
+        return text
+    # Fallback to abstract if PDF unavailable or extraction failed.
     return paper.get("summary") or ""
 
 
@@ -229,6 +306,12 @@ def _get_embedding(text):
         return None
 
 def build_embeddings(papers):
+    """Build (or rebuild) embeddings for semantic search.
+
+    If a full‑text cache file exists for a paper (``PDF_DIR/<safe_id>.txt``) we use up to
+    the first 8 000 characters of that text for the embedding. Otherwise we fall back to the
+    title + summary concatenation as before.
+    """
     import numpy as np
     _load_embeddings()
     paper_ids = [p.get("id") or p.get("entry_id") for p in papers]
@@ -237,7 +320,16 @@ def build_embeddings(papers):
     print("  Building embeddings for semantic search...")
     embeddings, ids = [], []
     for i, p in enumerate(papers):
-        text = (p.get("title") or "") + " " + (p.get("summary") or "")
+        safe_id = re.sub(r'[^a-zA-Z0-9._-]', '_', str(p.get("id") or p.get("entry_id") or ""))
+        cache_path = PDF_DIR / f"{safe_id}.txt"
+        if cache_path.exists():
+            try:
+                full_text = cache_path.read_text(encoding="utf-8")[:8000]
+            except Exception:
+                full_text = ""
+            text = full_text
+        else:
+            text = (p.get("title") or "") + " " + (p.get("summary") or "")
         emb = _get_embedding(text)
         if emb:
             embeddings.append(emb)
@@ -1289,6 +1381,60 @@ class Handler(SimpleHTTPRequestHandler):
             thread = threading.Thread(target=build_embeddings, args=(papers_global,), daemon=True)
             thread.start()
             self._json({"ok": True, "message": "Building embeddings in background..."})
+
+        elif path == "/api/fulltext":
+            if not self._rate_check():
+                return
+            paper_id = data.get("id", "")
+            force = data.get("force", False)
+            paper = None
+            for p in papers_global:
+                if p.get("id") == paper_id or p.get("entry_id") == paper_id:
+                    paper = p
+                    break
+            if not paper:
+                self._json({"error": "Paper not found", "id": paper_id}, status=404)
+                return
+            safe_id = re.sub(r'[^a-zA-Z0-9._-]', '_', str(paper_id))
+            cache_path = PDF_DIR / f"{safe_id}.txt"
+            if not force and cache_path.exists():
+                try:
+                    text = cache_path.read_text(encoding="utf-8")
+                    self._json({
+                        "id": paper_id,
+                        "title": paper.get("title", ""),
+                        "text": text[:50000],
+                        "chars": len(text),
+                        "cached": True,
+                        "source": "cache",
+                    })
+                    return
+                except Exception:
+                    pass
+            text = ""
+            source = "none"
+            pdf_url = paper.get("pdf_url", "")
+            if pdf_url:
+                pdf_path = download_pdf(pdf_url, paper_id)
+                if pdf_path:
+                    text = extract_pdf_text(pdf_path)
+                    source = "pdf"
+            if not text or text.startswith("["):
+                text = paper.get("summary") or ""
+                source = "abstract"
+            if text and not text.startswith("["):
+                try:
+                    cache_path.write_text(text, encoding="utf-8")
+                except Exception:
+                    pass
+            self._json({
+                "id": paper_id,
+                "title": paper.get("title", ""),
+                "text": text[:50000],
+                "chars": len(text),
+                "cached": False,
+                "source": source,
+            })
 
         else:
             self.send_error(404)

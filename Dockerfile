@@ -9,8 +9,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY server.py .
 COPY scraper.py .
+COPY enrichment.py .
 COPY prompts.json .
 COPY config.json .
+COPY grey_sources/ grey_sources/
 COPY data/ data/
 COPY index.html .
 

@@ -186,6 +186,27 @@ for _group in ALL_QUERY_GROUPS.values():
     ALL_QUERIES.update(_group)
 
 
+def load_existing_ids(data_dir):
+    """Load all existing paper IDs from data/raw/papers_*.json files."""
+    ids = set()
+    for f in Path(data_dir).glob("papers_*.json"):
+        try:
+            with open(f, "r", encoding="utf-8") as fp:
+                data = json.load(fp)
+                if isinstance(data, list):
+                    for p in data:
+                        pid = p.get("id") or p.get("entry_id")
+                        if pid:
+                            ids.add(pid)
+                        doi = p.get("doi") or p.get("DOI")
+                        if doi:
+                            doi_norm = doi.lower().strip().replace("https://doi.org/", "").replace("doi:", "").strip()
+                            ids.add(f"DOI:{doi_norm}")
+        except Exception:
+            pass
+    return ids
+
+
 class MultiSourceScraper:
     def __init__(self, delay=3):
         self.data_dir = Path("data/raw")
@@ -297,6 +318,59 @@ class MultiSourceScraper:
         pbar.close()
         return papers
 
+    # ── PubMed Central (PMC) ──────────────────────────────────────────────
+    def search_pubmedcentral(self, query, max_results=100):
+        """Search PubMed Central for full-text OA papers via E-utilities."""
+        papers = []
+        pbar = self._pbar(min(max_results, 200), f"PMC:{query[:20]}")
+        try:
+            r = self.session.get(
+                "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
+                params={
+                    'db': 'pmc', 'retmode': 'json', 'retmax': max_results,
+                    'term': query + ' AND "open access"[filter]',
+                    'sort': 'date'
+                },
+                timeout=30
+            )
+            ids = r.json().get('esearchresult', {}).get('idlist', [])
+            if not ids:
+                pbar.close()
+                return []
+            time.sleep(0.5)
+            r2 = self.session.get(
+                "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi",
+                params={'db': 'pmc', 'retmode': 'json', 'id': ','.join(ids[:max_results])},
+                timeout=30
+            )
+            summaries = r2.json().get('result', {})
+            for pmcid in ids[:max_results]:
+                if pmcid not in summaries:
+                    continue
+                s = summaries[pmcid]
+                title = s.get('title', 'No title')
+                authors = [a.get('name', '') for a in s.get('authors', [])]
+                abstract = s.get('abstract', '') or ""
+                pub_date = s.get('pubdate', s.get('sortpubdate', ''))
+                pdf_url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/PMC{pmcid}/pdf/"
+                papers.append({
+                    'id': f"PMC:{pmcid}",
+                    'title': title,
+                    'authors': authors,
+                    'summary': abstract,
+                    'published': pub_date,
+                    'pdf_url': pdf_url,
+                    'pdf_source': 'pmc',
+                    'source': 'PubMedCentral',
+                    'journal': s.get('fulljournalname', s.get('source', '')),
+                    'pmcid': pmcid,
+                })
+                pbar.update(1)
+        except Exception as e:
+            print(f"  PMC error: {e}")
+        pbar.close()
+        return papers
+
     # ── Semantic Scholar ──────────────────────────────────────────────────
     def search_semanticscholar(self, query, max_results=100):
         papers = []
@@ -305,13 +379,13 @@ class MultiSourceScraper:
             r = self.session.get(
                 "https://api.semanticscholar.org/graph/v1/paper/search",
                 params={'query': query, 'limit': min(max_results, 100),
-                        'fields': 'title,authors,abstract,url,publicationDate,year,venue'},
+                        'fields': 'title,authors,abstract,url,publicationDate,year,venue,openAccessPdf'},
                 timeout=30
             )
             if r.status_code == 200:
                 data = r.json()
                 for p in data.get('data', []):
-                    papers.append({
+                    paper_dict = {
                         'id': p.get('paperId', 'unknown'),
                         'title': p.get('title', ''),
                         'authors': [a.get('name', '') for a in p.get('authors', [])],
@@ -320,7 +394,12 @@ class MultiSourceScraper:
                         'pdf_url': p.get('url', '') or '',
                         'source': 'SemanticScholar',
                         'venue': p.get('venue', '')
-                    })
+                    }
+                    oa_pdf = p.get('openAccessPdf')
+                    if oa_pdf and oa_pdf.get('url'):
+                        paper_dict['pdf_url'] = oa_pdf['url']
+                        paper_dict['pdf_source'] = 'semanticscholar_oa'
+                    papers.append(paper_dict)
                     pbar.update(1)
         except Exception as e:
             print(f"  SS error: {e}")
@@ -420,6 +499,147 @@ class MultiSourceScraper:
         pbar.close()
         return papers
 
+    # ── bioRxiv ─────────────────────────────────────────────────────────────
+    def search_biorxiv(self, query, max_results=100):
+        """Search bioRxiv via their API."""
+        papers = []
+        pbar = self._pbar(min(max_results, 100), f"bioRxiv:{query[:20]}")
+        try:
+            r = self.session.get(
+                "https://api.biorxiv.org/details/biorxiv/0/9999",
+                params={'q': query, 'num_results': min(max_results, 100)},
+                timeout=30
+            )
+            if r.status_code == 200:
+                data = r.json()
+                for item in data.get('collection', [])[:max_results]:
+                    papers.append({
+                        'id': f"bioRxiv:{item.get('doi', '')}",
+                        'title': item.get('title', ''),
+                        'authors': [a.strip() for a in item.get('authors', '').split(';') if a.strip()],
+                        'summary': item.get('abstract', ''),
+                        'published': item.get('date', ''),
+                        'pdf_url': f"https://www.biorxiv.org/content/{item.get('doi', '')}.full.pdf" if item.get('doi') else '',
+                        'pdf_source': 'biorxiv',
+                        'source': 'bioRxiv',
+                        'doi': item.get('doi', ''),
+                    })
+                    pbar.update(1)
+        except Exception as e:
+            print(f"  bioRxiv error: {e}")
+        pbar.close()
+        return papers
+
+    # ── PsyArXiv ────────────────────────────────────────────────────────────
+    def search_psyarxiv(self, query, max_results=100):
+        """Search PsyArXiv via OSF API."""
+        papers = []
+        pbar = self._pbar(min(max_results, 100), f"PsyArXiv:{query[:20]}")
+        try:
+            r = self.session.get(
+                "https://api.osf.io/v2/preprints/",
+                params={
+                    'filter[provider]': 'psyarxiv',
+                    'page[size]': min(max_results, 100),
+                    'filter[title]': query,
+                },
+                timeout=30
+            )
+            if r.status_code == 200:
+                data = r.json()
+                for item in data.get('data', [])[:max_results]:
+                    attrs = item.get('attributes', {})
+                    papers.append({
+                        'id': f"PsyArXiv:{item.get('id', '')}",
+                        'title': attrs.get('title', ''),
+                        'authors': [],
+                        'summary': attrs.get('description', ''),
+                        'published': attrs.get('date_created', ''),
+                        'pdf_url': attrs.get('links', {}).get('download', '') if attrs.get('links') else '',
+                        'pdf_source': 'psyarxiv',
+                        'source': 'PsyArXiv',
+                    })
+                    pbar.update(1)
+        except Exception as e:
+            print(f"  PsyArXiv error: {e}")
+        pbar.close()
+        return papers
+
+    # ── OSF Preprints ───────────────────────────────────────────────────────
+    def search_osf(self, query, max_results=100):
+        """Search OSF Preprints (all providers)."""
+        papers = []
+        pbar = self._pbar(min(max_results, 100), f"OSF:{query[:20]}")
+        try:
+            r = self.session.get(
+                "https://api.osf.io/v2/preprints/",
+                params={
+                    'page[size]': min(max_results, 100),
+                    'filter[title]': query,
+                },
+                timeout=30
+            )
+            if r.status_code == 200:
+                data = r.json()
+                for item in data.get('data', [])[:max_results]:
+                    attrs = item.get('attributes', {})
+                    papers.append({
+                        'id': f"OSF:{item.get('id', '')}",
+                        'title': attrs.get('title', ''),
+                        'authors': [],
+                        'summary': attrs.get('description', ''),
+                        'published': attrs.get('date_created', ''),
+                        'pdf_url': attrs.get('links', {}).get('download', '') if attrs.get('links') else '',
+                        'pdf_source': 'osf',
+                        'source': 'OSF',
+                    })
+                    pbar.update(1)
+        except Exception as e:
+            print(f"  OSF error: {e}")
+        pbar.close()
+        return papers
+
+    # ── ResearchGate ────────────────────────────────────────────────────────
+    def search_researchgate(self, query, max_results=50):
+        """Search ResearchGate for papers (author-uploaded PDFs)."""
+        papers = []
+        pbar = self._pbar(min(max_results, 50), f"ResearchGate:{query[:20]}")
+        try:
+            r = self.session.get(
+                "https://www.researchgate.net/search/publication",
+                params={'q': query, 'type': 'publication'},
+                timeout=30,
+                headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Accept': 'text/html,application/xhtml+xml',
+                }
+            )
+            if r.status_code == 200:
+                html = r.text
+                pub_pattern = re.compile(
+                    r'"publicationType":"([^"]+)".*?"title":"([^"]+)".*?"doi":"([^"]*)".*?"url":"([^"]+)"',
+                    re.DOTALL
+                )
+                for m in pub_pattern.finditer(html):
+                    pub_type, title, doi, url = m.groups()
+                    papers.append({
+                        'id': f"RG:{doi or url.split('/')[-1]}",
+                        'title': title.replace('\\n', ' '),
+                        'authors': [],
+                        'summary': '',
+                        'published': '',
+                        'pdf_url': url if url.endswith('.pdf') else '',
+                        'source': 'ResearchGate',
+                        'doi': doi,
+                    })
+                    pbar.update(1)
+                    if len(papers) >= max_results:
+                        break
+        except Exception as e:
+            print(f"  ResearchGate error: {e}")
+        pbar.close()
+        return papers
+
     def _openalex_abstract(self, inverted):
         if not inverted:
             return ''
@@ -434,13 +654,23 @@ class MultiSourceScraper:
 
     # ── Dedup + save ──────────────────────────────────────────────────────
     def dedup(self, papers):
-        seen = {}
+        """Dedup by DOI first, then title normalization."""
+        seen_dois = set()
+        seen_titles = {}
         unique = []
         for p in papers:
+            doi = p.get("doi") or p.get("DOI") or ""
+            if doi:
+                doi_norm = doi.lower().strip().replace("https://doi.org/", "").replace("doi:", "").strip()
+                if doi_norm in seen_dois:
+                    continue
+                seen_dois.add(doi_norm)
             key = re.sub(r'[^\w]', '', p['title'].lower())[:100]
-            if key and key not in seen:
-                seen[key] = True
-                unique.append(p)
+            if key and key in seen_titles:
+                continue
+            if key:
+                seen_titles[key] = True
+            unique.append(p)
         return unique
 
     def save(self, papers, tag):
@@ -456,28 +686,58 @@ class MultiSourceScraper:
         return out
 
     # ── Run all queries ───────────────────────────────────────────────────
-    def run_all(self, queries, sources=None, max_per_query=50):
+    def run_all(self, queries, sources=None, max_per_query=50, incremental=False):
         """Run a dict of queries across multiple sources."""
         if sources is None:
             sources = ['arxiv', 'pubmed', 'semanticscholar', 'crossref', 'openalex']
+        existing_ids = set()
+        if incremental:
+            existing_ids = load_existing_ids(self.data_dir)
+            print(f"  Incremental mode: {len(existing_ids)} existing papers")
         all_papers = []
         for qname, qtext in queries.items():
             print(f"\n[{qname}]")
+            batch = []
             if 'arxiv' in sources:
                 print(f"  arXiv...")
-                all_papers.extend(self.search_arxiv(qtext, max_per_query))
+                batch.extend(self.search_arxiv(qtext, max_per_query))
             if 'pubmed' in sources:
                 print(f"  PubMed...")
-                all_papers.extend(self.search_pubmed(qtext, max_per_query))
+                batch.extend(self.search_pubmed(qtext, max_per_query))
+            if 'pubmedcentral' in sources:
+                print(f"  PubMed Central...")
+                batch.extend(self.search_pubmedcentral(qtext, max_per_query))
             if 'semanticscholar' in sources:
                 print(f"  Semantic Scholar...")
-                all_papers.extend(self.search_semanticscholar(qtext, max_per_query))
+                batch.extend(self.search_semanticscholar(qtext, max_per_query))
             if 'crossref' in sources:
                 print(f"  CrossRef...")
-                all_papers.extend(self.search_crossref(qtext, max_per_query))
+                batch.extend(self.search_crossref(qtext, max_per_query))
             if 'openalex' in sources:
                 print(f"  OpenAlex...")
-                all_papers.extend(self.search_openalex(qtext, max_per_query))
+                batch.extend(self.search_openalex(qtext, max_per_query))
+            if 'biorxiv' in sources:
+                print(f"  bioRxiv...")
+                batch.extend(self.search_biorxiv(qtext, max_per_query))
+            if 'psyarxiv' in sources:
+                print(f"  PsyArXiv...")
+                batch.extend(self.search_psyarxiv(qtext, max_per_query))
+            if 'osf' in sources:
+                print(f"  OSF...")
+                batch.extend(self.search_osf(qtext, max_per_query))
+            if 'researchgate' in sources:
+                print(f"  ResearchGate...")
+                batch.extend(self.search_researchgate(qtext, max_per_query))
+            if incremental:
+                filtered = [p for p in batch
+                            if (p.get("id") not in existing_ids)
+                            and (p.get("entry_id") not in existing_ids)]
+                skipped = len(batch) - len(filtered)
+                if skipped:
+                    print(f"  Skipped {skipped} already-seen papers")
+                all_papers.extend(filtered)
+            else:
+                all_papers.extend(batch)
         return self.dedup(all_papers)
 
 
@@ -505,13 +765,15 @@ if __name__ == "__main__":
     parser.add_argument('--tag', default=None, help='Output tag; defaults to query/group/custom')
     parser.add_argument('--delay', type=float, default=3, help='Delay between arXiv requests')
     parser.add_argument('-n', '--num', type=int, default=50, help='Max results per query')
-    parser.add_argument('--sources', default='arxiv,pubmed,semanticscholar,crossref,openalex',
+    parser.add_argument('--sources', default='arxiv,pubmed,pubmedcentral,semanticscholar,crossref,openalex,biorxiv,psyarxiv,osf,researchgate',
                         help='Comma-separated sources')
     parser.add_argument('--all-models', action='store_true', help='Run ALL behavioural model queries')
     parser.add_argument('--all-mena', action='store_true', help='Run ALL MENA queries')
     parser.add_argument('--all-combined', action='store_true', help='Run ALL combined queries')
     parser.add_argument('--everything', action='store_true', help='Run ALL queries across ALL sources')
     parser.add_argument('--list', action='store_true', help='List query groups and keys')
+    parser.add_argument('--incremental', action='store_true',
+                        help='Skip papers already in data/raw/ files')
     args = parser.parse_args()
 
     scraper = MultiSourceScraper(delay=args.delay)
@@ -549,16 +811,16 @@ if __name__ == "__main__":
 
     if args.everything:
         mode_label = 'ALL queries across ALL sources'
-        all_papers = scraper.run_all(ALL_QUERIES, sources, args.num)
+        all_papers = scraper.run_all(ALL_QUERIES, sources, args.num, incremental=args.incremental)
     elif args.all_models:
         mode_label = 'all behavioural model queries'
-        all_papers = scraper.run_all(BEHAVIOURAL_MODEL_QUERIES, sources, args.num)
+        all_papers = scraper.run_all(BEHAVIOURAL_MODEL_QUERIES, sources, args.num, incremental=args.incremental)
     elif args.all_mena:
         mode_label = 'all MENA queries'
-        all_papers = scraper.run_all(MENA_QUERIES, sources, args.num)
+        all_papers = scraper.run_all(MENA_QUERIES, sources, args.num, incremental=args.incremental)
     elif args.all_combined:
         mode_label = 'all combined queries'
-        all_papers = scraper.run_all(COMBINED_QUERIES, sources, args.num)
+        all_papers = scraper.run_all(COMBINED_QUERIES, sources, args.num, incremental=args.incremental)
     elif args.group:
         group_name = GROUP_ALIASES.get(args.group, args.group)
         if group_name not in ALL_QUERY_GROUPS:
@@ -566,7 +828,7 @@ if __name__ == "__main__":
         selected_group = group_name
         selected_queries = ALL_QUERY_GROUPS[group_name]
         mode_label = f'all queries in group: {group_name}'
-        all_papers = scraper.run_all(selected_queries, sources, args.num)
+        all_papers = scraper.run_all(selected_queries, sources, args.num, incremental=args.incremental)
     elif args.query:
         selected_group = 'custom key'
         qtext = ALL_QUERIES.get(args.query, args.query)
