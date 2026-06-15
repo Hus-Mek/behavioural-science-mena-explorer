@@ -989,7 +989,7 @@ def _ensure_behavioural_query(query_key):
         return query_key
     return f"({BEHAVIOURAL_QUERY_PREFIX}) AND ({query_key})"
 
-def run_scraper(query_key, count):
+def run_scraper(query_key, count, sources=None):
     global scraper_status, papers_global, analysis_global
     behavioural_query = _ensure_behavioural_query(query_key)
     scraper_status["running"] = True
@@ -998,8 +998,11 @@ def run_scraper(query_key, count):
     log_scraper(f"Starting scrape: {query_key} ({count} papers)")
     log_scraper(f"Behavioural query: {behavioural_query}")
     try:
+        cmd = [sys.executable, "scraper.py", "-q", behavioural_query, "-n", str(count)]
+        if sources:
+            cmd.extend(["--sources", ",".join(sources)])
         proc = subprocess.Popen(
-            [sys.executable, "scraper.py", "-q", behavioural_query, "-n", str(count)],
+            cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -1342,6 +1345,7 @@ class Handler(SimpleHTTPRequestHandler):
             elif path == "/api/scraper/run":
                 queries = data.get("queries", [])
                 max_count = int(data.get("max", 20))
+                sources = data.get("sources")
                 if not queries:
                     self._json({"error": "No queries provided."}, status=400)
                     return
@@ -1349,7 +1353,7 @@ class Handler(SimpleHTTPRequestHandler):
                     self._json({"error": "Scraper is already running."}, status=409)
                     return
                 for q in queries:
-                    t = threading.Thread(target=run_scraper, args=(q, max_count), daemon=True)
+                    t = threading.Thread(target=run_scraper, args=(q, max_count, sources), daemon=True)
                     t.start()
                 self._json({"ok": True, "message": f"Started scraper for {len(queries)} query group(s) ({max_count} papers each)."})
 

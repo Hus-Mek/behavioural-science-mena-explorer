@@ -297,6 +297,42 @@ html[data-theme="light"] .topbar{background:oklch(0.97 0.008 275 / 0.97);}
 .status-badge.err{background:oklch(0.68 0.19 22 / 0.16);color:var(--red);}
 .status-badge.warn{background:oklch(0.82 0.14 85 / 0.16);color:var(--yellow);}
 
+/* ── Chat Source Selector ─────────────────────────────── */
+.source-selector{display:flex;gap:4px;flex-wrap:wrap;}
+.source-btn{display:inline-flex;align-items:center;gap:6px;padding:7px 12px;border-radius:9px;font-size:12px;font-family:var(--sans);font-weight:500;cursor:pointer;background:var(--glass);border:1px solid var(--border);color:var(--text-3);transition:all .2s var(--ease);}
+.source-btn:hover{background:oklch(1 0 0 / 0.06);border-color:var(--border-2);color:var(--text);}
+.source-btn[aria-checked="true"]{background:var(--accent-bg);border-color:oklch(0.66 0.19 285 / 0.35);color:var(--accent);}
+.source-btn .source-icon{font-size:13px;}
+.source-btn:disabled{opacity:.4;cursor:not-allowed;}
+
+/* ── Paper Selection Modal ─────────────────────────────── */
+.paper-modal{position:fixed;inset:0;z-index:400;display:none;align-items:center;justify-content:center;background:oklch(0.05 0.02 274 / 0.7);}
+.paper-modal.open{display:flex;animation:fade .25s var(--ease);}
+.paper-modal .pmc{background:var(--bg-2);border:1px solid var(--border-2);border-radius:18px;padding:0;max-width:900px;width:94%;max-height:85vh;display:flex;flex-direction:column;box-shadow:var(--shadow-lg);overflow:hidden;}
+.paper-modal .pm-header{display:flex;align-items:center;justify-content:space-between;padding:16px 22px;border-bottom:1px solid var(--border);background:var(--bg-2);}
+.paper-modal .pm-header h3{font-family:var(--serif);font-size:18px;color:var(--text);margin:0;}
+.paper-modal .pm-search{padding:12px 22px;border-bottom:1px solid var(--border);background:var(--bg-2);}
+.paper-modal .pm-search .sinp{width:100%;padding:11px 14px 11px 38px;}
+.paper-modal .pm-select-all{display:flex;align-items:center;gap:8px;padding:10px 22px;border-bottom:1px solid var(--border);font-size:12px;color:var(--text-2);background:var(--glass);}
+.paper-modal .pm-list{overflow-y:auto;flex:1;padding:8px 16px;}
+.paper-modal .pm-item{display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:10px;cursor:pointer;transition:background .2s;}
+.paper-modal .pm-item:hover{background:oklch(1 0 0 / 0.04);}
+.paper-modal .pm-item input[type="checkbox"]{accent-color:var(--accent);width:16px;height:16px;flex-shrink:0;}
+.paper-modal .pm-item .pm-title{font-family:var(--serif);font-size:14px;font-weight:600;color:var(--text);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.paper-modal .pm-item .pm-meta{font-size:11px;color:var(--text-4);font-family:var(--mono);white-space:nowrap;}
+.paper-modal .pm-footer{display:flex;align-items:center;justify-content:space-between;padding:14px 22px;border-top:1px solid var(--border);background:var(--bg-2);}
+.paper-modal .pm-count{font-size:12px;color:var(--text-3);}
+.paper-modal .pm-count b{color:var(--accent);}
+
+/* ── Papers Tab Multi-Select ─────────────────────────────── */
+.pcard.selectable .pcard-checkbox{display:flex;}
+.pcard .pcard-checkbox{display:none;align-items:center;justify-content:center;width:28px;height:28px;flex-shrink:0;margin-right:8px;}
+.pcard .pcard-checkbox input{accent-color:var(--accent);width:18px;height:18px;cursor:pointer;}
+.selection-toolbar{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);z-index:100;display:none;align-items:center;gap:12px;padding:12px 20px;background:var(--solid);border:1px solid var(--border-2);border-radius:12px;box-shadow:var(--shadow-lg);animation:slideUp .3s var(--ease);}
+@keyframes slideUp{from{transform:translateX(-50%) translateY(20px);opacity:0;}to{transform:translateX(-50%) translateY(0);opacity:1;}}
+.selection-toolbar .sel-count{font-size:12px;color:var(--text-2);}
+.selection-toolbar .sel-count b{color:var(--accent);}
+
 /* ── Tools ─────────────────────────────── */
 .tool-section{background:var(--glass);border:1px solid var(--border);border-radius:var(--r);padding:20px;margin-bottom:16px;
   box-shadow:var(--shadow);}
@@ -549,6 +585,22 @@ html[data-theme="light"] .log{background:oklch(0.2 0.02 275 / 0.06);}
           <div class="sec-title">Research Chat</div>
           <div class="sec-desc">Ask questions across the corpus. The assistant retrieves relevant papers and synthesises a cited answer.</div>
           <div id="chatKeyStatus" style="margin-bottom:12px;"></div>
+          
+          <!-- Source Selector -->
+          <div class="fbar" style="margin-bottom:8px; gap:8px; flex-wrap:wrap;">
+            <span style="font-size:11px;color:var(--text-4);display:flex;align-items:center;">Source:</span>
+            <div class="source-selector" style="display:flex;gap:4px;flex-wrap:wrap;" role="radiogroup" aria-label="Paper source for chat">
+              <button class="source-btn" data-source="all" onclick="setChatSource('all')" role="radio" aria-checked="true"><span class="source-icon">📚</span>All Papers</button>
+              <button class="source-btn" data-source="latest" onclick="setChatSource('latest')" role="radio" aria-checked="false"><span class="source-icon">🕐</span>Latest Scrape</button>
+              <button class="source-btn" data-source="bookmarks" onclick="setChatSource('bookmarks')" role="radio" aria-checked="false"><span class="source-icon">⭐</span>Bookmarks</button>
+              <button class="source-btn" data-source="selected" onclick="setChatSource('selected')" role="radio" aria-checked="false"><span class="source-icon">✅</span>Selected</button>
+            </div>
+            <button class="btn btn-sec btn-sm" id="chatSelectPapersBtn" onclick="openPaperSelectionModal()" style="display:none;">Select Papers</button>
+          </div>
+          
+          <!-- Context Badge -->
+          <div id="chatContextBadge" style="font-size:11.5px;color:var(--text-4);margin-bottom:8px;min-height:18px;"></div>
+          
           <div class="fbar" style="margin-bottom:0;">
             <div class="search-wrap">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
@@ -614,12 +666,42 @@ html[data-theme="light"] .log{background:oklch(0.2 0.02 275 / 0.06);}
   </div>
 </div>
 
+<!-- Paper Selection Modal -->
+<div class="paper-modal" id="paperModal" role="dialog" aria-modal="true" onclick="if(event.target===this)closePaperModal()">
+  <div class="pmc">
+    <div class="pm-header">
+      <h3>Select Papers for Chat Context</h3>
+      <button class="btn btn-ghost btn-sm" onclick="closePaperModal()">Close</button>
+    </div>
+    <div class="pm-search">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="position:absolute;left:35px;top:50%;transform:translateY(-50%);width:16px;height:16px;color:var(--text-4);pointer-events:none;"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      <input class="sinp" id="paperModalSearch" placeholder="Search papers by title, author, year..." oninput="filterPaperModal()" aria-label="Search papers">
+    </div>
+    <div class="pm-select-all">
+      <label class="chk-item">
+        <input type="checkbox" id="paperModalSelectAll" onchange="togglePaperModalSelectAll(this.checked)">
+        <span>Select All Visible</span>
+      </label>
+    </div>
+    <div class="pm-list" id="paperModalList"></div>
+    <div class="pm-footer">
+      <span class="pm-count"><b id="paperModalSelectedCount">0</b> papers selected</span>
+      <button class="btn" id="paperModalConfirmBtn" onclick="confirmPaperModalSelection()" disabled>Add to Chat Context</button>
+    </div>
+  </div>
+</div>
+
 <script>
 // ════════════════════ STATE ════════════════════
 let PAPERS = [], ANALYSIS = {}, curPage = 1, curFiltered = [], CON_PAGE = 20;
 let readerList = [], readerIdx = 0, clusters = null, chatHistory = [], selectedPaperIndex = -1;
 let currentBatchJob = null, selectedQueries = [], lastSearchQuery = '';
 const LS = {bm:'bs_mena_bookmarks', hist:'bs_mena_search_history', theme:'bs_mena_theme'};
+
+// Chat source selection state (session-only)
+let chatSource = 'all'; // 'all' | 'latest' | 'bookmarks' | 'selected'
+let chatPaperIds = [];
+let chatLatestScrapeInfo = null;
 
 // ════════════════════ HELPERS ════════════════════
 const $ = s => document.querySelector(s);
@@ -1112,6 +1194,22 @@ const QUERY_GROUPS = {
   "Qualitative Research":"qualitative interview focus group thematic analysis grounded theory behaviour",
   "Quantitative Methods":"survey questionnaire regression correlation experimental behavioural science"
 };
+
+const ALL_SOURCES = [
+  {id: 'Arxiv', label: 'arXiv', default: true},
+  {id: 'Pubmed', label: 'PubMed', default: true},
+  {id: 'Pubmedcentral', label: 'PubMed Central', default: true},
+  {id: 'SS', label: 'Semantic Scholar', default: true},
+  {id: 'Crossref', label: 'CrossRef', default: false},
+  {id: 'Openalex', label: 'OpenAlex', default: false},
+  {id: 'Biorxiv', label: 'bioRxiv', default: false},
+  {id: 'Psyarxiv', label: 'PsyArXiv', default: false},
+  {id: 'Osf', label: 'OSF Preprints', default: false},
+  {id: 'Researchgate', label: 'ResearchGate', default: false},
+  {id: 'Libgen', label: 'LibGen (grey)', default: true},
+  {id: 'Annnas', label: "Anna's Archive (grey)", default: true},
+];
+
 function renderQueryTags(){
   const el = $('#queryTags'); if(!el) return;
   el.innerHTML = selectedQueries.map((q,i)=>'<span class="q-chip"><span class="q-text">'+esc(q)+'</span><span class="q-del" onclick="removeQuery('+i+')">&times;</span></span>').join('');
@@ -1132,8 +1230,9 @@ function addCustomQuery(){
 function runScraper(){
   if(!selectedQueries.length){ toast('Pick or add at least one query first','err'); return; }
   const max = parseInt($('#scraperMax').value,10)||20;
+  const sources = ALL_SOURCES.filter(s => $(`#src${s.id}`).checked).map(s => s.id);
   const log = $('#scraperLog'); if(log){ log.style.display='block'; log.textContent='Starting scraper…\n'; }
-  fetch('/api/scraper/run', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({queries:selectedQueries, max:max})})
+  fetch('/api/scraper/run', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({queries:selectedQueries, max:max, sources:sources})})
     .then(r=>r.json()).then(d=>{ if(log) log.textContent += (d.message||d.error||'')+'\n'; if(d.error) toast(d.error,'err'); else toast('Scraper started','ok'); })
     .catch(e=>{ if(log) log.textContent += 'Error: '+e+'\n'; toast('Scraper failed','err'); });
 }
@@ -1278,11 +1377,19 @@ function renderTools(keyInfo){
     + '<div class="q-chips" id="queryTags"></div><div class="presets-grid" id="presetsGrid">';
   for(const k in QUERY_GROUPS) h += '<button class="preset-btn" data-q="'+esc(k)+'" onclick="togglePreset(this,\''+esc(k).replace(/'/g,"\\'")+'\')" title="'+esc(QUERY_GROUPS[k])+'">'+esc(k)+'</button>';
   h += '</div><div class="q-row"><input type="text" id="scraperQueryCustom" placeholder="Type custom query terms, press Enter…"><button class="btn btn-sec" onclick="addCustomQuery()">+ Add</button></div>'
-    + '<div class="tool-row" style="margin-top:12px;"><label>Sources</label><div class="chk-group">'
+    + '<div class="tool-row" style="margin-top:12px;"><label>Sources</label><div class="chk-group" style="flex-wrap:wrap;gap:8px;">'
     + '<label class="chk-item"><input type="checkbox" id="srcArxiv" checked> arXiv</label>'
     + '<label class="chk-item"><input type="checkbox" id="srcPubmed" checked> PubMed</label>'
-    + '<label class="chk-item"><input type="checkbox" id="srcSS" checked> Semantic Scholar</label>'
-    + '<label class="chk-item"><input type="checkbox" id="srcCrossref"> CrossRef</label></div></div>'
+    + '<label class="chk-item"><input type="checkbox" id="srcPubmedcentral" checked> PubMed Central</label>'
+    + '<label class="chk-item"><input type="checkbox" id="srcSemanticscholar" checked> Semantic Scholar</label>'
+    + '<label class="chk-item"><input type="checkbox" id="srcCrossref"> CrossRef</label>'
+    + '<label class="chk-item"><input type="checkbox" id="srcOpenalex"> OpenAlex</label>'
+    + '<label class="chk-item"><input type="checkbox" id="srcBiorxiv"> bioRxiv</label>'
+    + '<label class="chk-item"><input type="checkbox" id="srcPsyarxiv"> PsyArXiv</label>'
+    + '<label class="chk-item"><input type="checkbox" id="srcOsf"> OSF</label>'
+    + '<label class="chk-item"><input type="checkbox" id="srcResearchgate"> ResearchGate</label>'
+    + '<label class="chk-item"><input type="checkbox" id="srcLibgen" checked> LibGen <span style="font-size:10px;color:var(--text-4);">(grey)</span></label>'
+    + '<label class="chk-item"><input type="checkbox" id="srcAnnals" checked> AnnAS <span style="font-size:10px;color:var(--text-4);">(grey)</span></label></div></div>'
     + '<div class="tool-row"><label>Max each</label><input type="number" id="scraperMax" value="20" min="1" max="100" style="width:74px;">'
     + '<button class="btn" onclick="runScraper()">Run Scraper</button><button class="btn btn-sec" onclick="checkScraperStatus()">Status</button></div>'
     + '<div id="scraperLog" class="log" style="display:none;"></div></div>';
