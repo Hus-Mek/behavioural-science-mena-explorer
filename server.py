@@ -478,6 +478,269 @@ def semantic_search(query, papers, top_k=15):
             results.append({"paper": paper, "score": float(similarities[idx])})
     return results
 
+def score_papers_by_embedding(papers, query, top_k=None):
+    _load_embeddings()
+    if _paper_embeddings is None or len(_paper_embeddings) == 0:
+        return []
+    query_emb = _get_embedding(query)
+    if query_emb is None:
+        return []
+    import numpy as np
+    query_vec = np.array(query_emb)
+    norms = np.linalg.norm(_paper_embeddings, axis=1)
+    query_norm = np.linalg.norm(query_vec)
+    if query_norm == 0:
+        return []
+    similarities = np.dot(_paper_embeddings, query_vec) / (norms * query_norm)
+    scored = []
+    for i, sim in enumerate(similarities):
+        pid = _paper_embedding_ids[i]
+        paper = next((p for p in papers if (p.get("id") or p.get("entry_id")) == pid), None)
+        if paper:
+            scored.append((paper, float(sim)))
+    scored.sort(key=lambda x: -x[1])
+    if top_k:
+        return scored[:top_k]
+    return scored
+
+def expand_query_by_embeddings(query, papers):
+    top_papers = score_papers_by_embedding(papers, query, top_k=5)
+    if not top_papers:
+        return []
+    titles = [p.get("title", "") for p, _ in top_papers]
+    freq = word_freq(titles, min_len=4)
+    query_words = set(re.findall(r'\b[a-zA-Z]{4,}\b', query.lower()))
+    expanded = [w for w, _ in freq if w not in query_words][:5]
+    return expanded
+
+EMBEDDING_GRAPH_CACHE = ROOT / "data" / "embedding_graph.json"
+KEYWORD_GRAPH_PATH = ROOT / "graphify-out" / "paper_graph.json"
+
+def build_embedding_graph(threshold=0.65):
+    import numpy as np
+    _load_embeddings()
+    if _paper_embeddings is None or len(_paper_embeddings) < 2:
+        print("  Not enough embeddings to build graph.")
+        return None
+
+    paper_ids = _paper_embedding_ids
+    print(f"  Computing embedding similarity matrix ({len(paper_ids)} papers)...")
+    embs = _paper_embeddings
+    norms = np.linalg.norm(embs, axis=1, keepdims=True)
+    sim_matrix = np.dot(embs, embs.T) / (norms * norms.T)
+    np.fill_diagonal(sim_matrix, 0)
+
+    # Union-Find for connected components (community detection)
+    parent = list(range(len(paper_ids)))
+    def _find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    def _union(x, y):
+        px, py = _find(x), _find(y)
+        if px != py:
+            parent[px] = py
+
+    edges = []
+    rows, cols = np.where(sim_matrix > threshold)
+    for r, c in zip(rows, cols):
+        if r < c:
+            ri, ci = int(r), int(c)
+            _union(ri, ci)
+            edges.append({
+                "source": paper_ids[ri],
+                "target": paper_ids[ci],
+                "weight": round(float(sim_matrix[ri, ci]), 4),
+                "type": "semantic"
+            })
+
+    # Assign community IDs
+    comp_map = {}
+    labels = []
+    for i in range(len(paper_ids)):
+        root = _find(i)
+        if root not in comp_map:
+            comp_map[root] = len(comp_map)
+        labels.append(comp_map[root])
+    n_components = len(comp_map)
+
+    # Build paper lookup for title/year
+    paper_lookup = {}
+    for p in papers_global:
+        pid = p.get("id") or p.get("entry_id")
+        if pid:
+            paper_lookup[pid] = p
+
+    nodes = []
+    for i, pid in enumerate(paper_ids):
+        p = paper_lookup.get(pid, {})
+        nodes.append({
+            "id": pid,
+            "title": p.get("title", ""),
+            "year": (p.get("published") or "")[:4],
+            "domain": "paper",
+            "community": int(labels[i])
+        })
+
+    graph = {
+        "directed": False,
+        "multigraph": True,
+        "nodes": nodes,
+        "edges": edges,
+        "meta": {
+            "type": "embedding_similarity",
+            "threshold": threshold,
+            "embedding_provider": EMBEDDING_PROVIDER,
+            "total_papers": len(paper_ids),
+            "total_edges": len(edges),
+            "communities": int(n_components)
+        }
+    }
+
+    try:
+        with open(EMBEDDING_GRAPH_CACHE, "w") as f:
+            json.dump(graph, f)
+        print(f"  Embedding graph saved: {len(nodes)} nodes, {len(edges)} edges, {n_components} communities")
+    except Exception as e:
+        print(f"  Warning: could not save embedding graph: {e}")
+
+    return graph
+
+
+def load_or_build_embedding_graph(threshold=0.65):
+    if EMBEDDING_GRAPH_CACHE.exists():
+        try:
+            return json.load(open(EMBEDDING_GRAPH_CACHE))
+        except Exception:
+            pass
+    return build_embedding_graph(threshold=threshold)
+
+
+def merge_graphs():
+    emb_graph = load_or_build_embedding_graph()
+    kw_graph = None
+    if KEYWORD_GRAPH_PATH.exists():
+        try:
+            kw_graph = json.load(open(KEYWORD_GRAPH_PATH, encoding="utf-8"))
+        except Exception as e:
+            print(f"  Could not load keyword graph: {e}")
+
+    if emb_graph is None and kw_graph is None:
+        return {"error": "No graphs available"}
+
+    if emb_graph is None:
+        merged = dict(kw_graph)
+        for e in merged.get("edges", []):
+            e["type"] = "keyword"
+        return merged
+
+    if kw_graph is None:
+        return emb_graph
+
+    all_nodes = {}
+    for n in emb_graph.get("nodes", []):
+        all_nodes[n["id"]] = n
+    for n in kw_graph.get("nodes", []):
+        if n["id"] not in all_nodes:
+            all_nodes[n["id"]] = n
+
+    all_edges = []
+    seen = set()
+    for e in emb_graph.get("edges", []):
+        key = (e["source"], e["target"])
+        if key not in seen:
+            seen.add(key)
+            seen.add((e["target"], e["source"]))
+            e["type"] = "semantic"
+            all_edges.append(e)
+
+    for e in kw_graph.get("edges", []):
+        key = (e["source"], e["target"])
+        if key not in seen:
+            seen.add(key)
+            seen.add((e["target"], e["source"]))
+            e["type"] = "keyword"
+            all_edges.append(e)
+        else:
+            existing = next(
+                (x for x in all_edges if (x["source"] == e["source"] and x["target"] == e["target"])
+                 or (x["source"] == e["target"] and x["target"] == e["source"])),
+                None
+            )
+            if existing and existing.get("type") == "semantic":
+                existing["type"] = "both"
+
+    return {
+        "directed": False,
+        "multigraph": True,
+        "nodes": list(all_nodes.values()),
+        "edges": all_edges,
+        "meta": {
+            "semantic_edges": len(emb_graph.get("edges", [])),
+            "keyword_edges": len(kw_graph.get("edges", [])),
+            "total_edges": len(all_edges),
+            "total_nodes": len(all_nodes)
+        }
+    }
+
+
+def hybrid_search(query, papers, top_k=30):
+    import numpy as np
+    import re as _re
+    ql = query.lower()
+    query_words = set(_re.findall(r'\b[a-zA-Z]{4,}\b', ql))
+
+    keyword_scores = {}
+    for p in papers:
+        text = ((p.get('title') or '') + ' ' + (p.get('summary') or '')).lower()
+        phrase_present = ql in text
+        word_overlap = sum(1 for w in query_words if w in text)
+        score = (3 if phrase_present else 0) + word_overlap
+        if score > 0:
+            keyword_scores[p.get("id") or p.get("entry_id")] = score
+
+    _load_embeddings()
+    semantic_scores = {}
+    if _paper_embeddings is not None and len(_paper_embeddings) > 0:
+        query_emb = _get_embedding(query)
+        if query_emb is not None:
+            query_vec = np.array(query_emb)
+            norms = np.linalg.norm(_paper_embeddings, axis=1)
+            query_norm = np.linalg.norm(query_vec)
+            if query_norm > 0:
+                similarities = np.dot(_paper_embeddings, query_vec) / (norms * query_norm)
+                for idx, pid in enumerate(_paper_embedding_ids):
+                    sim = float(similarities[idx])
+                    if sim > 0:
+                        semantic_scores[pid] = sim
+
+    combined = {}
+    for p in papers:
+        pid = p.get("id") or p.get("entry_id")
+        kw_score = keyword_scores.get(pid, 0)
+        sem_score = semantic_scores.get(pid, 0) * 3.0
+        final_score = kw_score * 0.4 + sem_score * 0.6
+        if final_score > 0:
+            combined[pid] = {
+                "score": final_score,
+                "keyword_score": kw_score,
+                "semantic_score": sem_score
+            }
+
+    if not combined:
+        return sorted(keyword_scores.items(), key=lambda x: -x[1])[:top_k]
+
+    ranked = sorted(combined.items(), key=lambda x: -x[1]["score"])[:top_k]
+    results = []
+    for pid, scores in ranked:
+        paper = next((p for p in papers if (p.get("id") or p.get("entry_id")) == pid), None)
+        if paper:
+            results.append((pid, scores["score"], scores))
+
+    return results
+
+
 ARABIC_PATTERN = re.compile(r'[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]')
 ARABIC_KEYWORDS = [
     "arabic", "arab", "عرب", "السعودية", "سعودي", "الإمارات", "إماراتي",
@@ -711,6 +974,43 @@ def load_papers():
     removed = len(unique) - len(deduped)
     if removed > 0:
         print(f"  Title dedup removed {removed} near-duplicate papers")
+
+    _load_embeddings()
+    if _paper_embeddings is not None and len(_paper_embedding_ids) > 0:
+        import numpy as np
+        deduped_ids = [(p.get("id") or p.get("entry_id")) for p in deduped]
+        deduped_to_emb = {}
+        for di, pid in enumerate(deduped_ids):
+            if pid in _paper_embedding_ids:
+                deduped_to_emb[di] = _paper_embedding_ids.index(pid)
+        if len(deduped_to_emb) > 1:
+            indices = list(deduped_to_emb.values())
+            emb_vectors = _paper_embeddings[indices]
+            norms = np.linalg.norm(emb_vectors, axis=1, keepdims=True)
+            sim_matrix = np.dot(emb_vectors, emb_vectors.T) / (norms * norms.T)
+            deduped_indices = list(deduped_to_emb.keys())
+            remove = set()
+            for i_idx in range(len(deduped_indices)):
+                for j_idx in range(i_idx + 1, len(deduped_indices)):
+                    if sim_matrix[i_idx][j_idx] > 0.92:
+                        di = deduped_indices[i_idx]
+                        dj = deduped_indices[j_idx]
+                        pi = deduped[di]
+                        pj = deduped[dj]
+                        if len(pi.get("summary") or "") >= len(pj.get("summary") or ""):
+                            sources_i = pi.get("sources") or [pi.get("source") or pi.get("id")]
+                            sources_j = pj.get("sources") or [pj.get("source") or pj.get("id")]
+                            pi["sources"] = list(set(sources_i + sources_j))
+                            remove.add(dj)
+                        else:
+                            sources_i = pi.get("sources") or [pi.get("source") or pi.get("id")]
+                            sources_j = pj.get("sources") or [pj.get("source") or pj.get("id")]
+                            pj["sources"] = list(set(sources_i + sources_j))
+                            remove.add(di)
+            if remove:
+                removed_emb = len(remove)
+                deduped = [p for i, p in enumerate(deduped) if i not in remove]
+                print(f"  Embedding dedup removed {removed_emb} cross-source duplicates")
     return deduped
 
 
@@ -771,7 +1071,44 @@ def load_latest_scrape():
     removed = len(unique) - len(deduped)
     if removed > 0:
         print(f"  Title dedup removed {removed} near-duplicate papers from latest scrape")
-    
+
+    _load_embeddings()
+    if _paper_embeddings is not None and len(_paper_embedding_ids) > 0:
+        import numpy as np
+        deduped_ids = [(p.get("id") or p.get("entry_id")) for p in deduped]
+        deduped_to_emb = {}
+        for di, pid in enumerate(deduped_ids):
+            if pid in _paper_embedding_ids:
+                deduped_to_emb[di] = _paper_embedding_ids.index(pid)
+        if len(deduped_to_emb) > 1:
+            indices = list(deduped_to_emb.values())
+            emb_vectors = _paper_embeddings[indices]
+            norms = np.linalg.norm(emb_vectors, axis=1, keepdims=True)
+            sim_matrix = np.dot(emb_vectors, emb_vectors.T) / (norms * norms.T)
+            deduped_indices = list(deduped_to_emb.keys())
+            remove = set()
+            for i_idx in range(len(deduped_indices)):
+                for j_idx in range(i_idx + 1, len(deduped_indices)):
+                    if sim_matrix[i_idx][j_idx] > 0.92:
+                        di = deduped_indices[i_idx]
+                        dj = deduped_indices[j_idx]
+                        pi = deduped[di]
+                        pj = deduped[dj]
+                        if len(pi.get("summary") or "") >= len(pj.get("summary") or ""):
+                            sources_i = pi.get("sources") or [pi.get("source") or pi.get("id")]
+                            sources_j = pj.get("sources") or [pj.get("source") or pj.get("id")]
+                            pi["sources"] = list(set(sources_i + sources_j))
+                            remove.add(dj)
+                        else:
+                            sources_i = pi.get("sources") or [pi.get("source") or pi.get("id")]
+                            sources_j = pj.get("sources") or [pj.get("source") or pj.get("id")]
+                            pj["sources"] = list(set(sources_i + sources_j))
+                            remove.add(di)
+            if remove:
+                removed_emb = len(remove)
+                deduped = [p for i, p in enumerate(deduped) if i not in remove]
+                print(f"  Embedding dedup removed {removed_emb} cross-source duplicates")
+
     timestamp = datetime.fromtimestamp(latest_file.stat().st_mtime).isoformat()
     return deduped, latest_file.name, timestamp
 
@@ -1090,6 +1427,50 @@ def search_papers(papers, query, fields=None):
     if fields is None:
         fields = ["title", "summary", "authors"]
     ql = query.lower()
+    import re as _re
+    query_words = set(_re.findall(r'\b[a-zA-Z]{2,}\b', ql))
+    exact_phrase = ql
+    keyword_scores = {}
+    for p in papers:
+        text = " ".join(str(p.get(f, "") or "") for f in fields).lower()
+        score = 2 if exact_phrase in text else 0
+        word_overlap = sum(1 for w in query_words if w in text)
+        score += min(word_overlap, 3)
+        score = min(score, 3)
+        if score > 0:
+            keyword_scores[p.get("id") or p.get("entry_id")] = score
+    _load_embeddings()
+    embedding_scores = {}
+    if _paper_embeddings is not None and len(_paper_embeddings) > 0:
+        query_emb = _get_embedding(query)
+        if query_emb is not None:
+            import numpy as np
+            query_vec = np.array(query_emb)
+            norms = np.linalg.norm(_paper_embeddings, axis=1)
+            query_norm = np.linalg.norm(query_vec)
+            if query_norm > 0:
+                similarities = np.dot(_paper_embeddings, query_vec) / (norms * query_norm)
+                for idx, pid in enumerate(_paper_embedding_ids):
+                    sim = float(similarities[idx])
+                    if sim > 0:
+                        embedding_scores[pid] = sim * 3.0
+    combined = []
+    for p in papers:
+        pid = p.get("id") or p.get("entry_id")
+        kw = keyword_scores.get(pid, 0)
+        emb = embedding_scores.get(pid, None)
+        if emb is not None:
+            final = kw * 0.3 + emb * 0.7
+        else:
+            final = kw
+        if final > 0:
+            d = dict(p)
+            d["_search_score"] = round(final, 4)
+            combined.append((final, d))
+    if combined:
+        combined.sort(key=lambda x: -x[0])
+        return [p for _, p in combined]
+    # Fallback: pure substring matching
     results = []
     for p in papers:
         for field in fields:
@@ -1099,7 +1480,9 @@ def search_papers(papers, query, fields=None):
             if val is None:
                 val = ""
             if ql in val.lower():
-                results.append(p)
+                d = dict(p)
+                d["_search_score"] = 1.0
+                results.append(d)
                 break
     return results
 
@@ -1166,6 +1549,17 @@ def run_scraper(query_key, count, sources=None):
             msg = f"\nDone. Total papers: {len(papers_global)}"
             scraper_status["output"] += msg
             log_scraper(msg.strip())
+            try:
+                _load_embeddings()
+                if _paper_embeddings is not None and len(_paper_embedding_ids) > 0:
+                    scored = score_papers_by_embedding(papers_global, query_key)
+                    high_rel = sum(1 for _, s in scored if s > 0.7)
+                    if high_rel > 0:
+                        rel_msg = f"Embedding relevance: {high_rel} papers with similarity > 0.7"
+                        scraper_status["output"] += "\n" + rel_msg
+                        log_scraper(rel_msg)
+            except Exception:
+                pass
         else:
             err_msg = f"\nScraper failed with return code {returncode}"
             scraper_status["output"] += err_msg
@@ -1269,13 +1663,69 @@ class Handler(SimpleHTTPRequestHandler):
                 })
                 return
 
+            elif path == "/api/embedding_graph":
+                logger.info("  embedding_graph handler ENTERED")
+                merged = params.get("merged", ["0"])[0] == "1"
+                rebuild = params.get("rebuild", ["0"])[0] == "1"
+                threshold = float(params.get("threshold", ["0.7"])[0])
+                logger.info(f"  merged={merged}, rebuild={rebuild}, threshold={threshold}")
+                if rebuild:
+                    graph = build_embedding_graph(threshold=threshold)
+                    if graph is None:
+                        self._json({"error": "Not enough embeddings to build graph."})
+                        return
+                else:
+                    graph = load_or_build_embedding_graph()
+                logger.info(f"  graph loaded: type={type(graph).__name__}")
+                if graph is None:
+                    self._json({"error": "Embedding graph not available. Build embeddings first."})
+                    return
+                if merged:
+                    result = merge_graphs()
+                else:
+                    result = graph
+                logger.info(f"  result type={type(result).__name__}, keys={list(result.keys())}")
+                self._json(result)
+                logger.info(f"  _json completed")
+                return
+
+            elif path == "/api/expand_query":
+                q = params.get("q", [""])[0]
+                if not q or len(q) < 2:
+                    self._json({"query": q, "expanded_terms": []})
+                    return
+                expanded = expand_query_by_embeddings(q, papers_global)
+                self._json({"query": q, "expanded_terms": expanded})
+                return
+
+            elif path == "/api/graph_stats":
+                graph = load_or_build_embedding_graph()
+                if graph is None or "error" in graph:
+                    self._json({"nodes": 0, "edges": 0, "communities": 0, "avg_degree": 0})
+                    return
+                nodes = len(graph.get("nodes", []))
+                edges = len(graph.get("edges", []))
+                communities = graph.get("meta", {}).get("communities", 0)
+                avg_degree = round(2 * edges / nodes, 2) if nodes > 0 else 0
+                self._json({"nodes": nodes, "edges": edges, "communities": communities, "avg_degree": avg_degree})
+                return
+
             elif path == "/api/papers":
                 q = params.get("q", [""])[0]
                 year = params.get("year", [""])[0]
                 term = params.get("term", [""])[0]
+                hybrid = params.get("hybrid", ["0"])[0] == "1"
                 result = list(papers_global)
                 if q and len(q) >= 2:
-                    result = search_papers(result, q)
+                    if hybrid:
+                        _load_embeddings()
+                        if _paper_embeddings is not None and len(_paper_embeddings) > 0:
+                            hybrid_results = hybrid_search(q, result, top_k=50)
+                            result = [next(p for p in result if (p.get("id") or p.get("entry_id")) == pid) for pid, _, _ in hybrid_results]
+                        else:
+                            result = search_papers(result, q)
+                    else:
+                        result = search_papers(result, q)
                 if year:
                     result = [p for p in result if p.get("published","").startswith(year)]
                 if term:
@@ -1550,22 +2000,13 @@ class Handler(SimpleHTTPRequestHandler):
                         papers = []
 
                 if source == "all":
-                    import re as _re
-                    query_lower = query.lower()
-                    query_phrases = [query_lower]
-                    query_words = set(_re.findall(r'\b[a-zA-Z]{4,}\b', query_lower))
-                    scored = []
-                    for p in papers_global:
-                        text = ((p.get('title') or '') + ' ' + (p.get('summary') or '')).lower()
-                        phrase_pattern = r'\b' + _re.escape(query_phrases[0]) + r'\b'
-                        score = 3 if _re.search(phrase_pattern, text) else 0
-                        score += sum(1 for w in query_words if w in text)
-                        if score > 0:
-                            scored.append((score, p))
-                    scored.sort(key=lambda x: -x[0])
-                    papers = [p for _, p in scored[:30]]
-                    if not papers:
-                        papers = papers_global[:30]
+                    results = semantic_search(query, papers_global, top_k=20)
+                    if results:
+                        papers = [r["paper"] for r in results]
+                    else:
+                        papers = search_papers(papers_global, query)[:30]
+                        if not papers:
+                            papers = papers_global[:30]
 
                 result = llm_rag_chat(query, papers, history=history)
                 if "content" in result and result["content"]:
@@ -1677,6 +2118,26 @@ class Handler(SimpleHTTPRequestHandler):
                     self._json({"error": "Paper graph not found. Build with: python build_paper_graph.py"})
                 return
 
+            elif path == "/api/embedding_graph":
+                rebuild = data.get("rebuild", False)
+                if rebuild:
+                    graph = build_embedding_graph(threshold=float(data.get("threshold", 0.7)))
+                    if graph is None:
+                        self._json({"error": "Not enough embeddings to build graph."})
+                        return
+                else:
+                    graph = load_or_build_embedding_graph()
+                if graph is None:
+                    self._json({"error": "Embedding graph not available. Build embeddings first."})
+                    return
+                merged = data.get("merged", False)
+                if merged:
+                    result = merge_graphs()
+                else:
+                    result = graph
+                self._json(result)
+                return
+
             elif path == "/api/shutdown":
                 self._json({"ok": True, "message": "Shutting down..."})
                 threading.Timer(0.5, self.server.shutdown).start()
@@ -1689,10 +2150,26 @@ class Handler(SimpleHTTPRequestHandler):
                     self._json({"error": "Query must be at least 2 characters."}, status=400)
                     return
                 top_k = int(data.get("top_k", 15))
-                results = semantic_search(query, papers_global, top_k=top_k)
-                papers_out = [{"id": r["paper"].get("id"), "title": r["paper"].get("title", ""),
-                               "summary": (r["paper"].get("summary") or "")[:300],
-                               "score": round(r["score"], 4)} for r in results]
+                hybrid = data.get("hybrid", False)
+                if hybrid:
+                    results = hybrid_search(query, papers_global, top_k=top_k)
+                    papers_out = []
+                    for pid, score, scores in results:
+                        paper = next((p for p in papers_global if (p.get("id") or p.get("entry_id")) == pid), None)
+                        if paper:
+                            papers_out.append({
+                                "id": pid,
+                                "title": paper.get("title", ""),
+                                "summary": (paper.get("summary") or "")[:300],
+                                "score": round(score, 4),
+                                "keyword_score": scores["keyword_score"],
+                                "semantic_score": round(scores["semantic_score"], 4)
+                            })
+                else:
+                    results = semantic_search(query, papers_global, top_k=top_k)
+                    papers_out = [{"id": r["paper"].get("id"), "title": r["paper"].get("title", ""),
+                                   "summary": (r["paper"].get("summary") or "")[:300],
+                                   "score": round(r["score"], 4)} for r in results]
                 self._json({"query": query, "results": papers_out, "count": len(papers_out)})
 
             elif path == "/api/arabic_papers":
@@ -1790,6 +2267,15 @@ class Handler(SimpleHTTPRequestHandler):
                     "cached": False,
                     "source": source,
                 })
+
+            elif path == "/api/expand_query":
+                query = data.get("query", "").strip()
+                if not query or len(query) < 2:
+                    self._json({"query": query, "expanded_terms": []})
+                    return
+                expanded = expand_query_by_embeddings(query, papers_global)
+                self._json({"query": query, "expanded_terms": expanded})
+                return
 
             else:
                 self.send_error(404)

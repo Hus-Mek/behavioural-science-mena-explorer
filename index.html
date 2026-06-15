@@ -613,9 +613,18 @@ html[data-theme="light"] .log{background:oklch(0.2 0.02 275 / 0.06);}
         <div class="panel">
           <div class="eyebrow">Network</div>
           <div class="sec-title">Paper Knowledge Graph</div>
-          <div class="sec-desc">Interactive map of paper connections via shared concepts and authors. Node colour indicates community clusters.</div>
-          <div style="height:78vh;border-radius:var(--r);border:1px solid var(--border);overflow:hidden;background:var(--solid);">
-            <iframe src="/paper_graph.html" style="width:100%;height:100%;border:none;" title="Paper graph"></iframe>
+          <div class="sec-desc">Interactive map of paper connections. Toggle between keyword-cooccurrence, semantic-similarity, or merged views.</div>
+          <div class="fbar" style="margin-bottom:12px;">
+            <select class="fsel" id="graphType" onchange="switchGraphView()" style="min-width:160px;">
+              <option value="keyword">Keyword Co-occurrence</option>
+              <option value="embedding">Semantic (Embedding) Similarity</option>
+              <option value="merged">Merged (Both)</option>
+            </select>
+            <button class="btn btn-sec btn-sm" id="rebuildEmbedGraphBtn" onclick="rebuildEmbedGraph()" style="display:none;">Rebuild Embedding Graph</button>
+            <span id="graphStats" style="font-size:11px;color:var(--text-4);margin-left:auto;"></span>
+          </div>
+          <div style="height:72vh;border-radius:var(--r);border:1px solid var(--border);overflow:hidden;background:var(--solid);">
+            <iframe id="graphFrame" src="/paper_graph.html" style="width:100%;height:100%;border:none;" title="Paper graph"></iframe>
           </div>
         </div>
       </section>
@@ -1556,6 +1565,29 @@ function addCustomQuery(){
   if(q.length<2 || selectedQueries.indexOf(q)!==-1) return;
   selectedQueries.push(q); input.value=''; renderQueryTags();
 }
+function expandQuery(){
+  if(!selectedQueries.length){ toast('Select at least one query first','err'); return; }
+  const query = selectedQueries[0];
+  const el = $('#expandedTerms');
+  el.innerHTML = '<span class="spinner"></span> Expanding…';
+  apiPost('/api/expand_query', {query: query}, (err, data)=>{
+    if(err || !data || !data.expanded_terms || !data.expanded_terms.length){
+      el.innerHTML = '<span style="font-size:11.5px;color:var(--text-4);">No expansion terms found</span>';
+      return;
+    }
+    el.innerHTML = data.expanded_terms.map(t =>
+      '<span class="tag" onclick="addExpandTerm(\''+esc(t).replace(/'/g,"\\'")+'\')">'+esc(t)+' <span style="font-size:10px;opacity:.6;">+</span></span>'
+    ).join('');
+    toast('Found '+data.expanded_terms.length+' expansion terms','ok');
+  });
+}
+function addExpandTerm(term){
+  if(selectedQueries.indexOf(term)===-1){
+    selectedQueries.push(term);
+    renderQueryTags();
+    syncPresetButtons();
+  }
+}
 let scraperPollTimer = null;
 
 function runScraper(){
@@ -1596,7 +1628,21 @@ function pollScraperStatus(){
     if(!d.running && scraperPollTimer){
       clearInterval(scraperPollTimer);
       scraperPollTimer = null;
-      if(d.returncode === 0) toast('Scraper finished','ok');
+      if(d.returncode === 0){
+        toast('Scraper finished','ok');
+        // Check for embedding relevance in output
+        if(log && d.output){
+          const relMatch = d.output.match(/Embedding relevance: (\d+) papers/);
+          if(relMatch){
+            const count = parseInt(relMatch[1]);
+            const color = count > 20 ? 'var(--green)' : count > 5 ? 'var(--yellow)' : 'var(--red)';
+            const totalMatch = d.output.match(/Total papers: (\d+)/);
+            const total = totalMatch ? parseInt(totalMatch[1]) : 0;
+            log.textContent += '\n' + (total ? total + ' papers found — ' : '') + count + ' highly relevant (embedding similarity > 0.7)';
+            log.scrollTop = log.scrollHeight;
+          }
+        }
+      }
       else if(d.returncode !== null) toast('Scraper exited with code '+d.returncode,'err');
     }
   }).catch(()=>{});
@@ -1728,6 +1774,74 @@ function clearAndRebuild(){
   });
 }
 document.addEventListener('DOMContentLoaded', function(){ fetchEmbedStatus(); });
+
+// ════════════════════ EMBEDDING GRAPH ════════════════════
+function switchGraphView(){
+  const type = $('#graphType').value;
+  const frame = $('#graphFrame');
+  const btn = $('#rebuildEmbedGraphBtn');
+  const stats = $('#graphStats');
+
+  if(type === 'keyword'){
+    frame.src = '/paper_graph.html';
+    btn.style.display = 'none';
+    stats.textContent = '';
+    return;
+  }
+
+  btn.style.display = 'inline-flex';
+
+  const query = type === 'merged' ? '?merged=1' : '';
+  frame.src = '/embedding_graph.html' + query;
+  stats.textContent = 'Loading…';
+}
+
+function rebuildEmbedGraph(){
+  const btn = $('#rebuildEmbedGraphBtn');
+  const threshold = parseFloat($('#embedGraphThreshold').value) || 0.7;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Building…';
+  apiPost('/api/embedding_graph', {rebuild: true, threshold: threshold, merged: $('#graphType').value === 'merged'}, (err, data)=>{
+    btn.disabled = false;
+    btn.innerHTML = 'Rebuild Embedding Graph';
+    if(err || data.error){
+      toast('Graph build failed: '+(err?err.message:data.error), 'err');
+      $('#graphStats').textContent = 'Failed';
+      return;
+    }
+    toast('Graph built: '+(data.nodes?data.nodes.length:0)+' nodes, '+(data.edges?data.edges.length:0)+' edges', 'ok');
+    $('#graphStats').textContent = (data.nodes?data.nodes.length:0)+' nodes · '+(data.edges?data.edges.length:0)+' edges';
+    // Refresh the iframe
+    const frame = $('#graphFrame');
+    const type = $('#graphType').value;
+    frame.src = type === 'merged' ? '/embedding_graph.html?merged=1' : '/embedding_graph.html';
+  });
+}
+
+function buildEmbedGraphFromTools(){
+  const btn = $('#buildEmbedGraphBtn');
+  const threshold = parseFloat($('#embedGraphThreshold').value) || 0.65;
+  const status = $('#embedGraphStatus');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Building…';
+  status.innerHTML = 'Computing similarity matrix ('+PAPERS.length+' papers)...';
+  apiPost('/api/embedding_graph', {rebuild: true, threshold: threshold, merged: false}, (err, data)=>{
+    btn.disabled = false;
+    btn.innerHTML = 'Build Semantic Graph';
+    if(err || data.error){
+      status.innerHTML = '<span class="status-badge err">Failed: '+(err?esc(err.message):esc(data.error))+'</span>';
+      toast('Graph build failed','err');
+      return;
+    }
+    const nodes = data.nodes?data.nodes.length:0;
+    const edges = data.edges?data.edges.length:0;
+    status.innerHTML = '<span class="status-badge ok">✓ '+nodes+' nodes, '+edges+' edges (threshold='+threshold+')</span>';
+    toast('Embedding graph built: '+edges+' edges','ok');
+    // Update graph tab stats
+    const gs = $('#graphStats');
+    if(gs) gs.textContent = nodes+' nodes · '+edges+' edges';
+  });
+}
 function findArabicPapers(){
   const min = parseInt($('#arabicMinScore').value)||3;
   const r = $('#arabicResults'); r.innerHTML = '<span class="spinner"></span> Searching…';
@@ -1792,7 +1906,10 @@ function renderTools(keyInfo){
   h += '<div class="tool-section"><h3>'+svg('<circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/>',2)+'Paper Scraper</h3>'
     + '<div class="q-chips" id="queryTags"></div><div class="presets-grid" id="presetsGrid">';
   for(const k in QUERY_GROUPS) h += '<button class="preset-btn" data-q="'+esc(k)+'" onclick="togglePreset(this,\''+esc(k).replace(/'/g,"\\'")+'\')" title="'+esc(QUERY_GROUPS[k])+'">'+esc(k)+'</button>';
-  h += '</div><div class="q-row"><input type="text" id="scraperQueryCustom" placeholder="Type custom query terms, press Enter…"><button class="btn btn-sec" onclick="addCustomQuery()">+ Add</button></div>'
+  h += '</div>'
+    + '<div class="tool-row" style="margin-bottom:6px;"><button class="btn btn-sec btn-sm" onclick="expandQuery()">Expand Query (AI)</button><span style="font-size:11px;color:var(--text-4);">Suggest related terms from embeddings</span></div>'
+    + '<div id="expandedTerms" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px;min-height:28px;"></div>'
+    + '<div class="q-row"><input type="text" id="scraperQueryCustom" placeholder="Type custom query terms, press Enter…"><button class="btn btn-sec" onclick="addCustomQuery()">+ Add</button></div>'
     + '<div class="tool-row" style="margin-top:12px;"><label>Sources</label><div class="chk-group" style="flex-wrap:wrap;gap:8px;">'
     + '<label class="chk-item"><input type="checkbox" id="srcArxiv" checked> arXiv</label>'
     + '<label class="chk-item"><input type="checkbox" id="srcPubmed" checked> PubMed</label>'
@@ -1825,7 +1942,13 @@ function renderTools(keyInfo){
     + '<div class="tool-row"><input class="sinp" id="semanticQuery" placeholder="e.g. health behaviour change in Saudi women" style="flex:1;min-width:200px;padding-left:14px;"><button class="btn" onclick="runSemanticSearch()">Search</button></div>'
     + '<div id="semanticResults" style="margin-top:12px;"></div></div>';
 
-  h += '<div class="tool-section"><h3>'+svg('<path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>',2)+'Embeddings</h3>'
+  h += '<div class="tool-section"><h3>'+svg('<circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="17" cy="17" r="2.5"/><path d="M8 16 16 8M9 18h6"/>',2)+'Knowledge Graph (Embedding)</h3>'
+    + '<div class="sec-desc">Build a semantic similarity graph from paper embeddings. Edges represent papers with cosine similarity > threshold.</div>'
+    + '<div class="tool-row"><label>Threshold</label><input type="number" id="embedGraphThreshold" value="0.7" min="0.1" max="0.99" step="0.02" style="width:74px;">'
+    + '<button class="btn" id="buildEmbedGraphBtn" onclick="buildEmbedGraphFromTools()">Build Semantic Graph</button></div>'
+    + '<div id="embedGraphStatus" style="font-size:11.5px;color:var(--text-4);margin-top:6px;"></div></div>'
+
+  + '<div class="tool-section"><h3>'+svg('<path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>',2)+'Embeddings</h3>'
     + '<div class="sec-desc">Semantic search requires paper embeddings. Build them first, then search by meaning.</div>'
     + '<div class="emb-status-row"><span class="emb-status-dot" id="embedStatusDot"></span><span id="embedStatusText">Checking…</span></div>'
     + '<div class="tool-row"><label>Provider</label><select id="embedProvider" class="fsel" onchange="onProviderChange()"><option value="gemini">Gemini Embedding 2 (multimodal, 3072-dim)</option><option value="openai">OpenAI text-embedding-3-small (1536-dim)</option></select></div>'
