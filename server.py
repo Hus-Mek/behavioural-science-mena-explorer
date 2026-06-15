@@ -515,6 +515,7 @@ def expand_query_by_embeddings(query, papers):
 
 EMBEDDING_GRAPH_CACHE = ROOT / "data" / "embedding_graph.json"
 KEYWORD_GRAPH_PATH = ROOT / "graphify-out" / "paper_graph.json"
+MERGED_GRAPH_CACHE = ROOT / "data" / "merged_graph.json"
 
 def build_embedding_graph(threshold=0.65):
     import numpy as np
@@ -615,6 +616,22 @@ def load_or_build_embedding_graph(threshold=0.65):
         except Exception:
             pass
     return build_embedding_graph(threshold=threshold)
+
+
+def load_or_build_merged_graph():
+    if MERGED_GRAPH_CACHE.exists():
+        try:
+            return json.load(open(MERGED_GRAPH_CACHE))
+        except Exception:
+            pass
+    merged = merge_graphs()
+    if merged and "error" not in merged:
+        try:
+            with open(MERGED_GRAPH_CACHE, "w") as f:
+                json.dump(merged, f)
+        except Exception:
+            pass
+    return merged
 
 
 def merge_graphs():
@@ -1593,7 +1610,11 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        self._headers_sent = True
+        try:
+            self.wfile.write(body)
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            raise
 
     def _rate_check(self):
         ip = self._get_client_ip()
@@ -1664,29 +1685,38 @@ class Handler(SimpleHTTPRequestHandler):
                 return
 
             elif path == "/api/embedding_graph":
-                logger.info("  embedding_graph handler ENTERED")
-                merged = params.get("merged", ["0"])[0] == "1"
-                rebuild = params.get("rebuild", ["0"])[0] == "1"
-                threshold = float(params.get("threshold", ["0.7"])[0])
-                logger.info(f"  merged={merged}, rebuild={rebuild}, threshold={threshold}")
-                if rebuild:
-                    graph = build_embedding_graph(threshold=threshold)
+                try:
+                    logger.info("  embedding_graph handler ENTERED")
+                    merged = params.get("merged", ["0"])[0] == "1"
+                    rebuild = params.get("rebuild", ["0"])[0] == "1"
+                    threshold = float(params.get("threshold", ["0.7"])[0])
+                    logger.info(f"  merged={merged}, rebuild={rebuild}, threshold={threshold}")
+                    if rebuild:
+                        graph = build_embedding_graph(threshold=threshold)
+                        if MERGED_GRAPH_CACHE.exists():
+                            MERGED_GRAPH_CACHE.unlink()
+                        if graph is None:
+                            self._json({"error": "Not enough embeddings to build graph."})
+                            return
+                    else:
+                        graph = load_or_build_embedding_graph()
+                    logger.info(f"  graph loaded: type={type(graph).__name__}")
                     if graph is None:
-                        self._json({"error": "Not enough embeddings to build graph."})
+                        self._json({"error": "Embedding graph not available. Build embeddings first."})
                         return
-                else:
-                    graph = load_or_build_embedding_graph()
-                logger.info(f"  graph loaded: type={type(graph).__name__}")
-                if graph is None:
-                    self._json({"error": "Embedding graph not available. Build embeddings first."})
-                    return
-                if merged:
-                    result = merge_graphs()
-                else:
-                    result = graph
-                logger.info(f"  result type={type(result).__name__}, keys={list(result.keys())}")
-                self._json(result)
-                logger.info(f"  _json completed")
+                    if merged:
+                        result = load_or_build_merged_graph()
+                    else:
+                        result = graph
+                    logger.info(f"  result type={type(result).__name__}, keys={list(result.keys())}")
+                    self._json(result)
+                    logger.info(f"  _json completed")
+                except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+                    raise
+                except Exception as e:
+                    logger.error(f"  embedding_graph handler error: {type(e).__name__}: {e}")
+                    if not getattr(self, '_headers_sent', False):
+                        self._json({"error": f"Graph error: {str(e)}"}, status=500)
                 return
 
             elif path == "/api/expand_query":
@@ -1813,7 +1843,8 @@ class Handler(SimpleHTTPRequestHandler):
         except Exception as e:
             with open(ROOT / "server_errors.log", 'a') as ef:
                 ef.write(f"[{datetime.now().isoformat()}] GET {self.path} ERROR: {type(e).__name__}: {e}\n")
-            self._json({"error": f"Internal error: {str(e)}"}, status=500)
+            if not getattr(self, '_headers_sent', False):
+                self._json({"error": f"Internal error: {str(e)}"}, status=500)
 
     def _handle_export(self, params):
         _err = open(os.path.join(tempfile.gettempdir(), 'export_debug.log'), 'w')
