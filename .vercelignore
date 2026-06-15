@@ -1,0 +1,10 @@
+__pycache__
+*.pyc
+data/pdfs/
+.hermes/
+tests/
+server.py
+scraper.py
+enrichment.py
+grey_sources/
+config.json

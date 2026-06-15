@@ -109,6 +109,16 @@ def get_api_key():
     cfg = load_config()
     return cfg.get("openrouter_api_key", os.environ.get("OPENROUTER_API_KEY", ""))
 
+def get_gemini_api_key():
+    cfg = load_config()
+    return cfg.get("gemini_api_key", os.environ.get("GEMINI_API_KEY", ""))
+
+EMBEDDING_PROVIDER = "gemini"
+EMBEDDING_MODEL_OPENAI = "text-embedding-3-small"
+EMBEDDING_MODEL_GEMINI = "models/gemini-embedding-2"
+EMBEDDING_BATCH_SIZE = 100
+GEMINI_EMBEDDING_DIM = 3072
+
 LLM_BASE_URL = "https://openrouter.ai/api/v1"
 LLM_MODEL = "poolside/laguna-m.1:free"
 LLM_FALLBACK_MODELS = [
@@ -252,8 +262,8 @@ def get_paper_full_text(paper, grey=False):
         return text
     return paper.get("summary") or ""
 
-EMBEDDING_MODEL = "text-embedding-3-small"
 EMBEDDING_CACHE = ROOT / "data" / "embeddings.json"
+EMBEDDING_META_CACHE = ROOT / "data" / "embeddings_meta.json"
 _paper_embeddings = None
 _paper_embedding_ids = []
 
@@ -273,11 +283,11 @@ def _load_embeddings():
     _paper_embeddings = None
     _paper_embedding_ids = []
 
-def _get_embedding(text):
+def _get_embedding_openai(text):
     api_key = get_api_key()
     if not api_key:
         return None
-    payload = json.dumps({"model": EMBEDDING_MODEL, "input": text[:8000]}).encode()
+    payload = json.dumps({"model": EMBEDDING_MODEL_OPENAI, "input": text[:8000]}).encode()
     req = urllib.request.Request(
         f"{LLM_BASE_URL}/embeddings", data=payload,
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
@@ -287,52 +297,163 @@ def _get_embedding(text):
             data = json.loads(resp.read())
             return data["data"][0]["embedding"]
     except Exception as e:
-        print(f"  Embedding error: {e}")
+        print(f"  OpenAI embedding error: {e}")
         return None
 
-def build_embeddings(papers):
-    api_key = get_api_key()
+def _get_embedding_gemini(text):
+    api_key = get_gemini_api_key()
     if not api_key:
-        print("  Skipping embeddings: no API key configured.")
-        return
+        return None
+    url = f"https://generativelanguage.googleapis.com/v1beta/{EMBEDDING_MODEL_GEMINI}:embedContent?key={api_key}"
+    payload = json.dumps({"content": {"parts": [{"text": text[:8000]}]}}).encode()
+    req = urllib.request.Request(
+        url, data=payload,
+        headers={"Content-Type": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read())
+            return data["embedding"]["values"]
+    except Exception as e:
+        print(f"  Gemini embedding error: {e}")
+        return None
+
+def _get_embedding_batch_gemini(texts):
+    api_key = get_gemini_api_key()
+    if not api_key:
+        return None
+    url = f"https://generativelanguage.googleapis.com/v1beta/{EMBEDDING_MODEL_GEMINI}:batchEmbedContents?key={api_key}"
+    requests_list = [{"model": EMBEDDING_MODEL_GEMINI, "content": {"parts": [{"text": t[:8000]}]}} for t in texts]
+    payload = json.dumps({"requests": requests_list}).encode()
+    req = urllib.request.Request(
+        url, data=payload,
+        headers={"Content-Type": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = json.loads(resp.read())
+            embeddings = data.get("embeddings", [])
+            return [e["values"] for e in embeddings]
+    except Exception as e:
+        print(f"  Gemini batch embedding error: {e}")
+        return None
+
+def _get_embedding(text):
+    if EMBEDDING_PROVIDER == "gemini":
+        return _get_embedding_gemini(text)
+    return _get_embedding_openai(text)
+
+def build_embeddings(papers, provider=None, batch=True):
     global _paper_embeddings, _paper_embedding_ids
     import numpy as np
+
+    if provider is None:
+        provider = EMBEDDING_PROVIDER
+
+    if provider == "gemini":
+        api_key = get_gemini_api_key()
+    else:
+        api_key = get_api_key()
+    if not api_key:
+        print(f"  Skipping embeddings: no API key for provider '{provider}'.")
+        return
+
     _load_embeddings()
     paper_ids = [p.get("id") or p.get("entry_id") for p in papers]
+
+    # Check cache: if same IDs and same provider, skip
     if _paper_embedding_ids == paper_ids and _paper_embeddings is not None:
-        return
-    print("  Building embeddings for semantic search...")
-    embeddings, ids = [], []
-    fail_fast = False
-    for i, p in enumerate(papers):
-        if fail_fast:
-            break
-        safe_id = re.sub(r'[^a-zA-Z0-9._-]', '_', str(p.get("id") or p.get("entry_id") or ""))
-        cache_path = PDF_DIR / f"{safe_id}.txt"
-        if cache_path.exists():
+        meta = {}
+        if EMBEDDING_META_CACHE.exists():
             try:
-                full_text = cache_path.read_text(encoding="utf-8")[:8000]
+                meta = json.load(open(EMBEDDING_META_CACHE))
             except Exception:
-                full_text = ""
-            text = full_text
-        else:
-            text = (p.get("title") or "") + " " + (p.get("summary") or "")
-        emb = _get_embedding(text)
-        if emb:
-            embeddings.append(emb)
-            ids.append(p.get("id") or p.get("entry_id"))
-        elif i == 0:
-            fail_fast = True
-        if (i + 1) % 10 == 0:
-            print(f"    {i+1}/{len(papers)} embedded")
+                pass
+        if meta.get("provider") == provider:
+            print(f"  Embeddings already built ({len(ids)} papers, provider={provider}).")
+            return
+
+    print(f"  Building embeddings (provider={provider}, batch={batch}, papers={len(papers)})...")
+    embeddings, ids = [], []
+
+    if provider == "gemini" and batch:
+        # Collect texts
+        texts = []
+        id_map = []
+        for p in papers:
+            safe_id = re.sub(r'[^a-zA-Z0-9._-]', '_', str(p.get("id") or p.get("entry_id") or ""))
+            cache_path = PDF_DIR / f"{safe_id}.txt"
+            if cache_path.exists():
+                try:
+                    full_text = cache_path.read_text(encoding="utf-8")[:8000]
+                except Exception:
+                    full_text = ""
+                text = full_text
+            else:
+                text = (p.get("title") or "") + " " + (p.get("summary") or "")
+            texts.append(text)
+            id_map.append(p.get("id") or p.get("entry_id"))
+
+        # Process in batches of EMBEDDING_BATCH_SIZE
+        batch_size = EMBEDDING_BATCH_SIZE
+        for batch_start in range(0, len(texts), batch_size):
+            batch_end = min(batch_start + batch_size, len(texts))
+            batch_texts = texts[batch_start:batch_end]
+            batch_ids = id_map[batch_start:batch_end]
+            print(f"    Embedding batch {batch_start+1}-{batch_end}/{len(texts)}...")
+            results = _get_embedding_batch_gemini(batch_texts)
+            if results:
+                for emb, pid in zip(results, batch_ids):
+                    if emb:
+                        embeddings.append(emb)
+                        ids.append(pid)
+            else:
+                # Fallback: try one-by-one for this batch
+                print(f"    Batch failed, falling back to single requests...")
+                for t, pid in zip(batch_texts, batch_ids):
+                    emb = _get_embedding_gemini(t)
+                    if emb:
+                        embeddings.append(emb)
+                        ids.append(pid)
+    else:
+        # Single-request mode (original behavior, works for both providers)
+        fail_fast = False
+        for i, p in enumerate(papers):
+            if fail_fast:
+                break
+            safe_id = re.sub(r'[^a-zA-Z0-9._-]', '_', str(p.get("id") or p.get("entry_id") or ""))
+            cache_path = PDF_DIR / f"{safe_id}.txt"
+            if cache_path.exists():
+                try:
+                    full_text = cache_path.read_text(encoding="utf-8")[:8000]
+                except Exception:
+                    full_text = ""
+                text = full_text
+            else:
+                text = (p.get("title") or "") + " " + (p.get("summary") or "")
+            if provider == "gemini":
+                emb = _get_embedding_gemini(text)
+            else:
+                emb = _get_embedding_openai(text)
+            if emb:
+                embeddings.append(emb)
+                ids.append(p.get("id") or p.get("entry_id"))
+            elif i == 0:
+                fail_fast = True
+            if (i + 1) % 10 == 0:
+                print(f"    {i+1}/{len(papers)} embedded")
+
     if embeddings:
         _paper_embeddings = np.array(embeddings)
         _paper_embedding_ids = ids
         try:
             json.dump({"embeddings": _paper_embeddings.tolist(), "ids": ids}, open(EMBEDDING_CACHE, "w"))
+            json.dump({"provider": provider, "model": EMBEDDING_MODEL_GEMINI if provider == "gemini" else EMBEDDING_MODEL_OPENAI, "count": len(ids)}, open(EMBEDDING_META_CACHE, "w"))
         except Exception:
             pass
-        print(f"  Embeddings built: {len(ids)} papers")
+        print(f"  Embeddings built: {len(ids)} papers (provider={provider})")
+    else:
+        print("  No embeddings were generated.")
 
 def semantic_search(query, papers, top_k=15):
     import numpy as np
@@ -998,7 +1119,7 @@ def run_scraper(query_key, count, sources=None):
     log_scraper(f"Starting scrape: {query_key} ({count} papers)")
     log_scraper(f"Behavioural query: {behavioural_query}")
     try:
-        cmd = [sys.executable, "scraper.py", "-q", behavioural_query, "-n", str(count)]
+        cmd = [sys.executable, "-u", "scraper.py", "-q", behavioural_query, "-n", str(count)]
         if sources:
             cmd.extend(["--sources", ",".join(sources)])
         proc = subprocess.Popen(
@@ -1127,6 +1248,24 @@ class Handler(SimpleHTTPRequestHandler):
                     "papers_count": len(papers_global),
                     "analysis": analysis_global,
                     "key": {"has_key": has_key}
+                })
+                return
+
+            elif path == "/api/embedding_status":
+                meta = {}
+                if EMBEDDING_META_CACHE.exists():
+                    try:
+                        meta = json.load(open(EMBEDDING_META_CACHE))
+                    except Exception:
+                        pass
+                _load_embeddings()
+                ready = _paper_embeddings is not None and len(_paper_embedding_ids) > 0
+                self._json({
+                    "ready": ready,
+                    "provider": meta.get("provider", EMBEDDING_PROVIDER),
+                    "model": meta.get("model", ""),
+                    "count": len(_paper_embedding_ids) if ready else 0,
+                    "total_papers": len(papers_global) if papers_global else 0,
                 })
                 return
 
@@ -1325,6 +1464,7 @@ class Handler(SimpleHTTPRequestHandler):
         return
 
     def do_POST(self):
+        global _paper_embeddings, _paper_embedding_ids
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         content_length = int(self.headers.get("Content-Length", 0))
@@ -1573,12 +1713,29 @@ class Handler(SimpleHTTPRequestHandler):
                 scored.sort(key=lambda x: -x["score"])
                 self._json({"results": scored, "count": len(scored), "min_score": min_score})
 
+            elif path == "/api/clear_embeddings":
+                _paper_embeddings = None
+                _paper_embedding_ids = []
+                try:
+                    if EMBEDDING_CACHE.exists():
+                        EMBEDDING_CACHE.unlink()
+                except Exception:
+                    pass
+                try:
+                    if EMBEDDING_META_CACHE.exists():
+                        EMBEDDING_META_CACHE.unlink()
+                except Exception:
+                    pass
+                self._json({"ok": True, "message": "Embeddings cleared"})
+
             elif path == "/api/build_embeddings":
                 if not self._rate_check():
                     return
-                thread = threading.Thread(target=build_embeddings, args=(papers_global,), daemon=True)
+                provider = data.get("provider", EMBEDDING_PROVIDER)
+                use_batch = data.get("batch", True)
+                thread = threading.Thread(target=build_embeddings, args=(papers_global,), kwargs={"provider": provider, "batch": use_batch}, daemon=True)
                 thread.start()
-                self._json({"ok": True, "message": "Building embeddings in background..."})
+                self._json({"ok": True, "message": f"Building embeddings in background (provider={provider}, batch={use_batch})..."})
 
             elif path == "/api/fulltext":
                 if not self._rate_check():

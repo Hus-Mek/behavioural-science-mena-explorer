@@ -1,11 +1,13 @@
 # config.json
 
-Copy this file and fill in your OpenRouter API key:
+Copy this file and fill in your API keys:
 
 ```json
 {
-  "openrouter_api_key": "your-key-here"
+  "openrouter_api_key": "your-openrouter-key-here",
+  "gemini_api_key": "your-gemini-key-here"
 }
 ```
 
-Get your key at https://openrouter.ai/keys
+Get your OpenRouter key at https://openrouter.ai/keys
+Get your Gemini key at https://aistudio.google.com/app/apikey
