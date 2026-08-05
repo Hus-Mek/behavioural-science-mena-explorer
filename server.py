@@ -128,6 +128,12 @@ LLM_BASE_URL = "https://openrouter.ai/api/v1"
 # became paid-only. Only gpt-oss-20b still answered, so every LLM call burned a
 # 404 round trip on the dead primary before falling through to it.
 # laguna-s-2.1 is the successor to the laguna-m.1 this project was built around.
+# Chat context limits. One constant so the prompt, the citation validator and the
+# papers_used payload can never describe different lists.
+MAX_CONTEXT_PAPERS = 30
+MAX_HISTORY_TURNS = 20
+MAX_HISTORY_CHARS = 8000
+
 LLM_MODEL = "poolside/laguna-s-2.1:free"
 LLM_FALLBACK_MODELS = [
     "openai/gpt-oss-20b:free",
@@ -954,6 +960,57 @@ ANALYSIS_CACHE = ROOT / "data" / "analysis_cache.json"
 ANALYSIS_DIR = ROOT / "data" / "analyses"
 ANALYSIS_DIR.mkdir(parents=True, exist_ok=True)
 
+# ── Export field sanitisers ────────────────────────────────────────────────
+# Every field below originates in a third-party API response or scraped HTML.
+
+_CSV_FORMULA_LEAD = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_cell(value):
+    """Neutralise spreadsheet formula injection and flatten newlines.
+
+    A cell beginning =, +, -, @, TAB or CR is executed as a formula by Excel and
+    Google Sheets, so a scraped paper title of `=cmd|' /c calc'!A1` runs as the
+    user who opens the export. Prefixing with an apostrophe forces text.
+    """
+    text = "" if value is None else str(value)
+    text = text.replace("\r", " ").replace("\n", " ")
+    if text[:1] in _CSV_FORMULA_LEAD:
+        text = "'" + text
+    return text
+
+
+def _tex_escape(value):
+    """Escape the LaTeX specials that break or silently truncate a .bib entry."""
+    text = "" if value is None else str(value)
+    text = text.replace("\\", r"\textbackslash{}")  # first, or it re-escapes the rest
+    for ch, rep in (("{", r"\{"), ("}", r"\}"), ("%", r"\%"), ("$", r"\$"),
+                    ("&", r"\&"), ("#", r"\#"), ("_", r"\_"),
+                    ("~", r"\textasciitilde{}"), ("^", r"\textasciicircum{}")):
+        text = text.replace(ch, rep)
+    return " ".join(text.split())
+
+
+def _bibtex_key(paper, index):
+    """A cite key that is unique and legal even when the paper has no id."""
+    raw = str(paper.get("id") or paper.get("entry_id") or "")
+    # "/" is legal in a BibTeX key and is part of every DOI, so keep it -- stripping
+    # it silently rewrote 10.1016/j.tra as 10.1016j.tra and broke key/DOI identity.
+    # BibTeX cannot handle , { } = or whitespace in a key; those go.
+    key = re.sub(r"[^A-Za-z0-9:./_-]", "", raw)
+    return key or f"paper{index}"
+
+
+def _export_year(paper):
+    pub = paper.get("published") or ""
+    if not pub:
+        return ""
+    try:
+        return str(datetime.fromisoformat(str(pub).replace("Z", "+00:00")).year)
+    except Exception:
+        return str(pub)[:4]
+
+
 def atomic_write_json(path, obj, **dump_kwargs):
     """Write JSON via a temp file in the same directory, then os.replace.
 
@@ -1449,8 +1506,9 @@ def llm_batch_summarise(papers):
     return results
 
 def llm_rag_chat(query, papers_context, history=None):
+    papers_context = list(papers_context)[:MAX_CONTEXT_PAPERS]
     context_parts = []
-    for i, p in enumerate(papers_context[:30]):
+    for i, p in enumerate(papers_context):
         abstract = (p.get('summary') or '')[:500]
         context_parts.append(f"[Paper {i+1}] {p.get('title', '')}\n{abstract}")
     context = "\n\n".join(context_parts)
@@ -1763,7 +1821,10 @@ class Handler(SimpleHTTPRequestHandler):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        # No Access-Control-Allow-Origin. The UI is served by this same server, so
+        # it is same-origin and needs none; the wildcard that used to be here let
+        # ANY page the user visited read every endpoint cross-origin -- including
+        # the corpus, the scraper logs, and (before the fix above) the API key.
         self.send_header("Connection", "close")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -1780,7 +1841,6 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_response(429)
             self.send_header("Retry-After", str(retry_after))
             self.send_header("Connection", "close")
-            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(json.dumps({"error": "Rate limit exceeded. Try again later."}).encode())
             return False
@@ -1949,8 +2009,18 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._handle_export(params)
 
             elif path == "/api/config/key":
+                # Never return the key itself. This used to send
+                # {"key": "sk-or-v1-..."} in full, and with the wildcard CORS
+                # header that was below, any page the user visited could read it
+                # with a plain fetch() -- a simple GET needs no preflight. The UI
+                # only ever consumes has_key and model.
                 cfg = load_config()
-                self._json({"key": cfg.get("openrouter_api_key", "")})
+                key = cfg.get("openrouter_api_key", "") or ""
+                self._json({
+                    "has_key": bool(key),
+                    "key_suffix": key[-4:] if len(key) >= 4 else "",
+                    "model": LLM_MODEL,
+                })
                 return
 
             elif path == "/api/scraper/status":
@@ -2028,28 +2098,25 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json({"error": f"Internal error: {str(e)}"}, status=500)
 
     def _handle_export(self, params):
-        _err = open(os.path.join(tempfile.gettempdir(), 'export_debug.log'), 'w')
+        # Debug instrumentation removed: this used to open a fixed-name log in the
+        # system temp dir on every export (mode "w", so concurrent exports on
+        # ThreadingHTTPServer clobbered each other) and write the user's search
+        # terms into it. logger already covers what it was for.
         try:
             fmt = params.get("format", ["csv"])[0].lower()
-            _err.write(f"format={fmt}\n")
             q = params.get("q", [""])[0]
-            _err.write(f"q={q}\n")
             ids_param = params.get("ids", [""])[0]
-            _err.write(f"ids={ids_param}\n")
 
             result = list(papers_global)
-            _err.write(f"papers_global len={len(result)}\n")
 
             if q and len(q) >= 2:
                 result = search_papers(result, q)
-                _err.write(f"after search: {len(result)} papers\n")
 
             if ids_param:
                 ids_set = {i.strip() for i in ids_param.split(",") if i.strip()}
                 result = [p for p in result if str(p.get("id") or p.get("entry_id", "")) in ids_set]
-                _err.write(f"after id filter: {len(result)} papers\n")
 
-            _err.write(f"building {fmt} export for {len(result)} papers\n")
+            logger.info(f"export fmt={fmt} papers={len(result)}")
 
             if fmt == "json":
                 body = json.dumps(result, ensure_ascii=False, indent=2).encode("utf-8")
@@ -2057,23 +2124,28 @@ class Handler(SimpleHTTPRequestHandler):
                 ext = "json"
             elif fmt == "bibtex":
                 entries = []
-                for p in result:
-                    pid = str(p.get("id") or p.get("entry_id") or "")
-                    title = (p.get("title") or "").replace("{", "\\{").replace("}", "\\}")
-                    authors_list = p.get("authors") or []
-                    author = " and ".join(authors_list)
-                    year = ""
-                    pub = p.get("published", "")
-                    if pub:
-                        try:
-                            year = str(datetime.fromisoformat(pub.replace("Z", "+00:00")).year)
-                        except Exception:
-                            year = pub[:4]
-                    abstract = (p.get("summary") or "").replace("{", "\\{").replace("}", "\\}")
-                    url = p.get("url", "")
-                    entry = f"@article{{{pid},\\n  title={{ {title} }},\\n  author={{ {author} }},\\n  year={{ {year} }},\\n  abstract={{ {abstract} }},\\n  url={{ {url} }}\\n}}"
-                    entries.append(entry)
-                body = "\\n\\n".join(entries).encode("utf-8")
+                for i, p in enumerate(result):
+                    pid = _bibtex_key(p, i)
+                    title = _tex_escape(p.get("title"))
+                    author = " and ".join(
+                        _tex_escape(a) for a in (p.get("authors") or []) if isinstance(a, str))
+                    year = _export_year(p)
+                    abstract = _tex_escape(p.get("summary"))
+                    url = _tex_escape(p.get("url") or p.get("pdf_url"))
+                    # Real newlines. These were "\\n" in the source, so the whole
+                    # .bib came out as one line and "\n  title=" is not a parseable
+                    # field name -- no BibTeX or Zotero import could ever have
+                    # succeeded.
+                    entries.append(
+                        f"@article{{{pid},\n"
+                        f"  title = {{{title}}},\n"
+                        f"  author = {{{author}}},\n"
+                        f"  year = {{{year}}},\n"
+                        f"  abstract = {{{abstract}}},\n"
+                        f"  url = {{{url}}}\n"
+                        f"}}"
+                    )
+                body = ("\n\n".join(entries) + "\n").encode("utf-8")
                 ct = "application/x-bibtex"
                 ext = "bib"
             else:
@@ -2081,48 +2153,42 @@ class Handler(SimpleHTTPRequestHandler):
                 writer = csv.writer(output)
                 writer.writerow(["id", "title", "authors", "year", "abstract", "url"])
                 for p in result:
-                    pid = str(p.get("id") or p.get("entry_id") or "")
-                    title = (p.get("title") or "").replace("\n", " ").replace("\r", " ")
-                    authors = "; ".join(p.get("authors") or [])
-                    year = ""
-                    pub = p.get("published", "")
-                    if pub:
-                        try:
-                            year = str(datetime.fromisoformat(pub.replace("Z", "+00:00")).year)
-                        except Exception:
-                            year = pub[:4]
-                    abstract = (p.get("summary") or "").replace("\n", " ").replace("\r", " ")
-                    url = p.get("url", "")
-                    writer.writerow([pid, title, authors, year, abstract, url])
-                body = output.getvalue().encode("utf-8")
+                    writer.writerow([
+                        _csv_cell(p.get("id") or p.get("entry_id")),
+                        _csv_cell(p.get("title")),
+                        _csv_cell("; ".join(a for a in (p.get("authors") or []) if isinstance(a, str))),
+                        _csv_cell(_export_year(p)),
+                        _csv_cell(p.get("summary")),
+                        _csv_cell(p.get("url") or p.get("pdf_url")),
+                    ])
+                # utf-8-sig: Excel on Windows decodes a BOM-less UTF-8 CSV as the
+                # ANSI codepage, which mangles every Arabic and accented title.
+                body = output.getvalue().encode("utf-8-sig")
                 ct = "text/csv"
                 ext = "csv"
 
-            fname = "papers_export_{0}_{1}.{2}".format(
-                len(result),
-                q.replace(" ", "_")[:20] if q else "all",
-                ext
-            )
-            _err.write(f"sending response, body len={len(body)}\n")
+            # The filename went into the header raw, so an Arabic query raised
+            # UnicodeEncodeError (send_header encodes latin-1 strict) -> HTTP 500 on
+            # a MENA-focused tool, and a quote in the query broke the header value.
+            slug = re.sub(r'[^A-Za-z0-9_-]', '', (q or "all").replace(" ", "_"))[:20] or "all"
+            fname = f"papers_export_{len(result)}_{slug}.{ext}"
             self.send_response(200)
             self.send_header("Content-Type", ct + "; charset=utf-8")
             self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
             self.send_header("Connection", "close")
-            self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
+            self._headers_sent = True
             self.wfile.write(body)
         except ConnectionAbortedError:
             pass
         except Exception as e:
-            _err.write(f"ERROR: {type(e).__name__}: {e}\n")
-            import traceback
-            traceback.print_exc(file=_err)
-            _err.close()
-            self._json({"error": f"Export failed: {str(e)}"}, status=500)
-            return
-        finally:
-            _err.close()
+            logger.exception("export failed")
+            # Only send an error response if no status line went out already;
+            # otherwise a second send_response embeds an HTTP status line as a
+            # header and the client stores the JSON error as the "downloaded file".
+            if not getattr(self, '_headers_sent', False):
+                self._json({"error": f"Export failed: {str(e)}"}, status=500)
         return
 
     def do_POST(self):
@@ -2199,9 +2265,27 @@ class Handler(SimpleHTTPRequestHandler):
                 if not query:
                     self._json({"error": "No query provided."}, status=400)
                     return
-                history = data.get("history", [])
-                paper_ids = data.get("paper_ids", [])
+                # history came straight from the client into the OpenRouter messages
+                # array with no validation, so a caller could inject a "system" turn
+                # or relay megabytes to the paid API. The 20-turn cap was client-side
+                # only.
+                history = []
+                for turn in (data.get("history") or [])[-MAX_HISTORY_TURNS:]:
+                    if not isinstance(turn, dict):
+                        continue
+                    role, content = turn.get("role"), turn.get("content")
+                    if role in ("user", "assistant") and isinstance(content, str):
+                        history.append({"role": role, "content": content[:MAX_HISTORY_CHARS]})
+
+                paper_ids = [str(i) for i in (data.get("paper_ids") or [])
+                             if isinstance(i, (str, int))][:MAX_CONTEXT_PAPERS * 4]
                 source = data.get("source", "all")
+                if source not in ("all", "latest", "bookmarks", "selected"):
+                    # Was left to fall through with `papers` unbound, so any typo or
+                    # older client got a 500 reading "cannot access local variable
+                    # 'papers'" and the chat bubble showed only "Error: HTTP 500".
+                    source = "all"
+                papers = []
                 warning = None
 
                 if source == "latest":
@@ -2231,15 +2315,20 @@ class Handler(SimpleHTTPRequestHandler):
                         if not papers:
                             papers = papers_global[:30]
 
+                # Slice ONCE, here, so the prompt, the citation validator and
+                # papers_used all describe the same list. Previously the prompt was
+                # built from papers[:30] while the validator used len(papers), so with
+                # 100 selected papers a "[Paper 63]" citation passed validation, had no
+                # entry in papers_used, and the frontend rendered it as literal text --
+                # a citation-shaped token with no source and no warning.
+                papers = papers[:MAX_CONTEXT_PAPERS]
                 result = llm_rag_chat(query, papers, history=history)
-                if "content" in result and result["content"]:
-                    import re as _rev
-                    cited = _rev.findall(r'\[Paper (\d+)\]', result["content"])
-                    max_idx = len(papers)
-                    invalid = [c for c in cited if int(c) < 1 or int(c) > max_idx]
+                if isinstance(result, dict) and result.get("content"):
+                    cited = re.findall(r'\[Paper (\d+)\]', result["content"])
+                    invalid = [c for c in cited if not (1 <= int(c) <= len(papers))]
                     if invalid:
                         result["content"] += "\n\n[Warning: citations " + ", ".join(invalid) + " refer to papers not in the context. They may be hallucinated.]"
-                papers_meta = [{"id": p.get("id"), "title": p.get("title", "")} for p in papers[:30]]
+                papers_meta = [{"id": p.get("id"), "title": p.get("title", "")} for p in papers]
                 response_data = {"query": query, "papers_used": papers_meta, "response": result}
                 if warning:
                     response_data["warning"] = warning
@@ -2372,7 +2461,11 @@ class Handler(SimpleHTTPRequestHandler):
                 if not query or len(query) < 2:
                     self._json({"error": "Query must be at least 2 characters."}, status=400)
                     return
-                top_k = int(data.get("top_k", 15))
+                try:
+                    top_k = int(data.get("top_k", 15))
+                except (TypeError, ValueError):
+                    top_k = 15
+                top_k = max(1, min(top_k, 100))  # was unguarded: 'abc' 500'd, -5 silently truncated
                 hybrid = data.get("hybrid", False)
                 if hybrid:
                     results = hybrid_search(query, papers_global, top_k=top_k)
