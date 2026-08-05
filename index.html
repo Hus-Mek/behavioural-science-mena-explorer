@@ -576,7 +576,7 @@ html[data-theme="light"] .log{background:oklch(0.2 0.02 275 / 0.06);}
           <select class="fsel" id="pYear" onchange="doPSearch()"><option value="">All years</option></select>
           <select class="fsel" id="pConcept" onchange="doPSearch()"><option value="">All concepts</option></select>
           <select class="fsel" id="pGroup" onchange="doPSearch()"><option value="">Flat list</option><option value="year">Group by year</option><option value="concept">Group by concept</option></select>
-          <button class="btn-sec" id="papersMultiSelectBtn" onclick="togglePapersMultiSelect()">${svg('<path d="M16 3h5a2 2 0 0 1 2 2v5"/>',1.8)}Select Mode</button>
+          <button class="btn-sec" id="papersMultiSelectBtn" onclick="togglePapersMultiSelect()"></button>
         </div>
         <div id="pList"></div>
         <div class="pag" id="pPag"></div>
@@ -762,7 +762,9 @@ let chatLatestScrapeInfo = null;
 // ════════════════════ HELPERS ════════════════════
 const $ = s => document.querySelector(s);
 const $$ = s => document.querySelectorAll(s);
-const esc = s => { const d = document.createElement('div'); d.textContent = (s==null?'':s); return d.innerHTML; };
+// Escapes & < > via the DOM, then " by hand: innerHTML does NOT escape quotes, and
+// scraped titles (arXiv/PubMed/LibGen) land inside double-quoted title="…" attributes.
+const esc = s => { const d = document.createElement('div'); d.textContent = (s==null?'':s); return d.innerHTML.replace(/"/g,'&quot;'); };
 function escH(s, q){
   if(!q || !s) return esc(s);
   try {
@@ -1029,7 +1031,7 @@ function renderPapersFlat(){
       ? '<div class="pcard-checkbox"><input type="checkbox" ' + (isSelected ? 'checked' : '') + ' onchange="event.stopPropagation(); togglePaperSelection(\''+esc(p.id)+'\')"></div>'
       : '';
     const cardClass = papersMultiSelectMode ? 'pcard selectable' : 'pcard';
-    h += '<div class="'+cardClass+'" data-pid="'+esc(p.id)+'" tabindex="0" role="button" onclick="openReader('+idx+');selectedPaperIndex='+idx+'" onkeydown="if(event.key===\'Enter\'){openReader('+idx+');selectedPaperIndex='+idx+'}">'
+    h += '<div class="'+cardClass+'" data-pid="'+esc(p.id)+'" tabindex="0" role="button" onclick="openReader('+idx+')" onkeydown="if(event.key===\'Enter\'){openReader('+idx+')}">'
       + checkboxHtml
       + '<div class="ptitle"><span class="tx">'+escH(p.title,q)+'</span>'
       + '<span class="star'+(isBookmarked(p.id)?' on':'')+'" onclick="event.stopPropagation();toggleBookmark(\''+esc(p.id)+'\')">★</span></div>';
@@ -1066,7 +1068,7 @@ function renderPGrouped(type){
         ? '<div class="pcard-checkbox"><input type="checkbox" ' + (isSelected ? 'checked' : '') + ' onchange="event.stopPropagation(); togglePaperSelection(\''+esc(p.id)+'\')"></div>'
         : '';
       const cardClass = papersMultiSelectMode ? 'pcard selectable' : 'pcard';
-      h += '<div class="'+cardClass+'" data-pid="'+esc(p.id)+'" tabindex="0" role="button" onclick="openReader('+idx+');selectedPaperIndex='+idx+'" onkeydown="if(event.key===\'Enter\'){openReader('+idx+');selectedPaperIndex='+idx+'}">'
+      h += '<div class="'+cardClass+'" data-pid="'+esc(p.id)+'" tabindex="0" role="button" onclick="openReader('+idx+')" onkeydown="if(event.key===\'Enter\'){openReader('+idx+')}">'
         + checkboxHtml
         + '<div class="ptitle"><span class="tx">'+esc(p.title)+'</span>'
         + '<span class="star'+(isBookmarked(p.id)?' on':'')+'" onclick="event.stopPropagation();toggleBookmark(\''+esc(p.id)+'\')">★</span></div>'
@@ -1145,10 +1147,19 @@ function showUnclusteredPapers(){
 function sklCards(n){ let h=''; for(let i=0;i<n;i++) h+='<div class="skl-card"><div class="skl a"></div><div class="skl b"></div><div class="skl c"></div><div class="skl d"></div></div>'; return h; }
 
 // ════════════════════ CHAT ════════════════════
+// marked is a CDN script, but this tool runs on localhost and is often used offline.
+// Without this guard an unreachable CDN threw inside the response handler, leaving the
+// "Searching the corpus…" spinner up forever with no error shown.
+function renderMarkdown(text){
+  if(typeof marked !== 'undefined' && marked && typeof marked.parse === 'function'){
+    try { return marked.parse(text); } catch(e){ /* fall through to plain text */ }
+  }
+  return '<p>' + esc(text).replace(/\n{2,}/g,'</p><p>').replace(/\n/g,'<br>') + '</p>';
+}
 function renderChatStatus(keyInfo){
   const el = $('#chatKeyStatus');
-  if(keyInfo && keyInfo.has_key) el.innerHTML = '<span class="status-badge ok">●  API key active'+(keyInfo.model?' — '+esc(keyInfo.model):'')+'</span>';
-  else el.innerHTML = '<span class="status-badge err">●  No API key — set one in Tools to enable AI</span>';
+  if(keyInfo && keyInfo.has_key) el.innerHTML = '<span class="status-badge ok">● API key active'+(keyInfo.model?' · '+esc(keyInfo.model):'')+'</span>';
+  else el.innerHTML = '<span class="status-badge err">● No API key. Set one in Tools.</span>';
 }
 function sendChat(){
   const input = $('#chatInput'), query = input.value.trim();
@@ -1166,7 +1177,7 @@ function sendChat(){
     if(err){ a.innerHTML = '<div class="chat-label">Assistant</div><div class="chat-bubble" style="color:var(--red);">Error: '+esc(err.message)+'</div>'; scrollChatToBottom(); return; }
     const resp = data.response||{}, content = resp.content || resp.reasoning || 'No response from AI.';
     const used = data.papers_used||[];
-    let rendered = marked.parse(content);
+    let rendered = renderMarkdown(content);
     rendered = rendered.replace(/\[Paper (\d+)\]/g, (m,num)=>{
       const i = parseInt(num)-1;
       if(i>=0 && i<used.length){
@@ -1209,7 +1220,7 @@ async function loadLatestScrapeForChat(){
     }
     chatLatestScrapeInfo = data;
     chatPaperIds = data.papers.map(p => p.id).slice(0, 30);
-    badge.innerHTML = `🕐 <b>Latest Scrape</b> • ${data.count} papers (${esc(data.source_file)})`;
+    badge.innerHTML = `<b>Latest scrape</b> • ${data.count} papers (${esc(data.source_file)})`;
     updateSourceButtons();
   } catch(e){
     badge.innerHTML = '<span class="status-badge err">Failed to load latest scrape</span>';
@@ -1227,7 +1238,7 @@ function loadBookmarksForChat(){
     return;
   }
   chatPaperIds = bookmarks;
-  $('#chatContextBadge').innerHTML = `⭐ <b>Bookmarks</b> • ${bookmarks.length} papers`;
+  $('#chatContextBadge').innerHTML = `<b>Bookmarks</b> • ${bookmarks.length} papers`;
   updateSourceButtons();
 }
 
@@ -1275,20 +1286,20 @@ function updateChatContextBadge(){
   const totalPapers = PAPERS.length;
   switch(chatSource){
     case 'all':
-      badge.textContent = `📚 All Papers • ${totalPapers} papers`;
+      badge.textContent = `All papers • ${totalPapers} papers`;
       break;
     case 'latest':
       if(chatLatestScrapeInfo){
-        badge.innerHTML = `🕐 <b>Latest Scrape</b> • ${chatLatestScrapeInfo.count} papers (${esc(chatLatestScrapeInfo.source_file)})`;
+        badge.innerHTML = `<b>Latest scrape</b> • ${chatLatestScrapeInfo.count} papers (${esc(chatLatestScrapeInfo.source_file)})`;
       } else {
-        badge.textContent = '🕐 Latest Scrape • loading…';
+        badge.textContent = 'Latest scrape • loading…';
       }
       break;
     case 'bookmarks':
-      badge.innerHTML = `⭐ <b>Bookmarks</b> • ${chatPaperIds.length} papers`;
+      badge.innerHTML = `<b>Bookmarks</b> • ${chatPaperIds.length} papers`;
       break;
     case 'selected':
-      badge.innerHTML = `✅ <b>Selected</b> • ${chatPaperIds.length} papers`;
+      badge.innerHTML = `<b>Selected</b> • ${chatPaperIds.length} papers`;
       break;
   }
   const selectBtn = $('#chatSelectPapersBtn');
@@ -1346,7 +1357,7 @@ function renderPaperModalList(){
     h += `<div class="pm-item" onclick="togglePaperModalItem('${esc(p.id)}', event)">
       <input type="checkbox" ${checked} onchange="event.stopPropagation(); togglePaperModalItem('${esc(p.id)}')">
       <span class="pm-title" title="${esc(p.title)}">${esc(p.title)}</span>
-      <span class="pm-meta">${esc((p.authors||[]).slice(0,2).join(', '))}${p.authors.length > 2 ? ' et al.' : ''} • ${esc(year)}</span>
+      <span class="pm-meta">${esc((p.authors||[]).slice(0,2).join(', '))}${(p.authors||[]).length > 2 ? ' et al.' : ''} • ${esc(year)}</span>
     </div>`;
   });
   el.innerHTML = h;
@@ -1403,21 +1414,23 @@ function confirmPaperModalSelection(){
 let papersMultiSelectMode = false;
 let papersSelectedIds = [];
 
+// Single owner of the button's label/state, so entering, leaving, and boot can't disagree.
+function renderMultiSelectBtn(){
+  const btn = $('#papersMultiSelectBtn'); if(!btn) return;
+  btn.classList.toggle('on', papersMultiSelectMode);
+  btn.innerHTML = papersMultiSelectMode
+    ? svg('<path d="M20 6 9 17l-5-5"/>',1.8) + 'Exit select mode'
+    : svg('<rect x="3" y="3" width="18" height="18" rx="2.5"/>',1.8) + 'Select mode';
+}
+function exitPapersMultiSelect(){
+  papersMultiSelectMode = false;
+  papersSelectedIds = [];
+  renderMultiSelectBtn();
+  updateSelectionToolbar();
+}
 function togglePapersMultiSelect(){
-  papersMultiSelectMode = !papersMultiSelectMode;
-  const btn = $('#papersMultiSelectBtn');
-  if(btn){
-    if(papersMultiSelectMode){
-      btn.classList.add('on');
-      btn.innerHTML = svg('<path d="M20 6 9 17l-5-5"/>',1.8) + 'Exit Select Mode';
-    } else {
-      btn.classList.remove('on');
-      btn.innerHTML = svg('<path d="M16 3h5a2 2 0 0 1 2 2v5"/>',1.8) + 'Select Mode';
-      papersSelectedIds = [];
-      updateSelectionToolbar();
-      renderPapers(); // Re-render to remove checkboxes
-    }
-  }
+  if(papersMultiSelectMode) exitPapersMultiSelect();
+  else { papersMultiSelectMode = true; renderMultiSelectBtn(); }
   renderPapers();
 }
 
@@ -1449,8 +1462,7 @@ function addSelectedPapersToChat(){
   if(papersSelectedIds.length === 0) return;
   chatSource = 'selected';
   chatPaperIds = papersSelectedIds.slice();
-  papersMultiSelectMode = false;
-  papersSelectedIds = [];
+  exitPapersMultiSelect(); // clears ids, resets the button, hides the floating toolbar
   navTo('chat');
   updateSourceButtons();
   updateChatContextBadge();
@@ -1458,18 +1470,25 @@ function addSelectedPapersToChat(){
 }
 
 // ════════════════════ READER ════════════════════
-function openReaderById(id){
-  if(!id) return;
-  const idx = PAPERS.findIndex(p=>p.id===id);
-  if(idx>=0) openReader(idx);
-}
-function openReader(idx){
-  readerList = curFiltered.length ? curFiltered : PAPERS;
-  readerIdx = readerList.indexOf(PAPERS[idx]);
-  if(readerIdx<0) readerIdx = 0;
+// The reader is driven by a paper object, not by an index into a list other than the one
+// on screen. That mismatch is what made j/k (and citation links) silently open the first
+// filtered result instead of the intended paper.
+function openReaderByPaper(p){
+  if(!p) return;
+  const visible = curFiltered.length ? curFiltered : PAPERS;
+  // A chat citation or bookmark can point outside the active filter; fall back to the
+  // full corpus so the correct paper opens rather than index 0 of the filtered list.
+  readerList = visible.indexOf(p) !== -1 ? visible : PAPERS;
+  readerIdx = Math.max(0, readerList.indexOf(p));
+  selectedPaperIndex = readerIdx;
   $('#reader').classList.add('open');
   renderReader();
   document.addEventListener('keydown', readerKeys);
+}
+function openReader(idx){ openReaderByPaper(PAPERS[idx]); }
+function openReaderById(id){
+  if(id==null || id==='') return;
+  openReaderByPaper(PAPERS.find(p=>String(p.id)===String(id)));
 }
 function closeReader(){ $('#reader').classList.remove('open'); document.removeEventListener('keydown', readerKeys); }
 function readerNav(d){ readerIdx = Math.max(0, Math.min(readerList.length-1, readerIdx+d)); renderReader(); $('.reader-inner').scrollTop = 0; }
@@ -1544,8 +1563,8 @@ const ALL_SOURCES = [
   {id: 'Psyarxiv', label: 'PsyArXiv', default: false},
   {id: 'Osf', label: 'OSF Preprints', default: false},
   {id: 'Researchgate', label: 'ResearchGate', default: false},
-  {id: 'Libgen', label: 'LibGen (grey)', default: true},
-  {id: 'Annas', label: "Anna's Archive (grey)", default: true},
+  {id: 'Libgen', label: 'LibGen', default: true, grey: true},
+  {id: 'Annas', label: "Anna's Archive", default: true, grey: true},
 ];
 
 function renderQueryTags(){
@@ -1603,7 +1622,7 @@ function runScraper(){
   }
   if(!selectedQueries.length){ toast('Pick or add at least one query first','err'); return; }
   const max = parseInt($('#scraperMax').value,10)||20;
-  const sources = ALL_SOURCES.filter(s => $(`#src${s.id}`).checked).map(s => s.id.toLowerCase());
+  const sources = ALL_SOURCES.filter(s => { const el = $('#src'+s.id); return el && el.checked; }).map(s => s.id.toLowerCase());
   const log = $('#scraperLog'); if(log){ log.style.display='block'; log.textContent=''; }
   fetch('/api/scraper/run', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({queries:selectedQueries, max:max, sources:sources})})
     .then(r=>r.json()).then(d=>{
@@ -1716,10 +1735,15 @@ function fetchEmbedStatus(){
     const txt = $('#embedStatusText');
     const btn = $('#buildEmbedBtn');
     const sel = $('#embedProvider');
+    if(!dot || !txt || !btn) return; // Tools tab not rendered yet
     if(d.ready){
       dot.style.background='var(--green)';
       txt.textContent = d.provider+' · '+d.model+' · '+d.count+'/'+d.total_papers+' papers';
       if(sel && sel.value === d.provider) btn.disabled = true; else btn.disabled = false;
+    } else if(d.stale){
+      dot.style.background='var(--yellow)';
+      txt.textContent = d.provider+' · '+d.model+' · '+d.count+'/'+d.total_papers+' papers (stale — new papers need embedding)';
+      btn.disabled = false;
     } else {
       dot.style.background='var(--red)';
       txt.textContent = 'Not built · '+d.total_papers+' papers available';
@@ -1727,14 +1751,15 @@ function fetchEmbedStatus(){
     }
     if(sel) sel.value = d.provider;
   }).catch(()=>{
-    $('#embedStatusDot').style.background='var(--text-4)';
-    $('#embedStatusText').textContent = 'Server unreachable';
+    const dot = $('#embedStatusDot'), txt = $('#embedStatusText');
+    if(dot) dot.style.background='var(--text-4)';
+    if(txt) txt.textContent = 'Server unreachable';
   });
 }
 function onProviderChange(){
   const sel = $('#embedProvider').value;
   fetch('/api/embedding_status').then(r=>r.json()).then(d=>{
-    if(d.ready && d.provider === sel){ $('#buildEmbedBtn').disabled = true; }
+    if(d.ready && !d.stale && d.provider === sel){ $('#buildEmbedBtn').disabled = true; }
     else { $('#buildEmbedBtn').disabled = false; }
   }).catch(()=>{});
 }
@@ -1742,7 +1767,7 @@ function buildEmbeddings(){
   const provider = $('#embedProvider').value;
   const btn = $('#buildEmbedBtn');
   fetch('/api/embedding_status').then(r=>r.json()).then(d=>{
-    if(d.ready && d.provider === provider){ toast('Embeddings already built for '+provider,'ok'); return; }
+    if(d.ready && !d.stale && d.provider === provider){ toast('Embeddings already built for '+provider,'ok'); return; }
     btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Building…';
     $('#embedProgress').style.display = 'block';
     $('#embedProgressBar').style.width = '0%';
@@ -1751,7 +1776,7 @@ function buildEmbeddings(){
       if(err){ btn.disabled=false; btn.textContent='Build Embeddings'; $('#embedProgress').style.display='none'; toast('Error: '+err.message,'err'); return; }
       const iv = setInterval(()=>{
         fetch('/api/embedding_status').then(r=>r.json()).then(d2=>{
-          if(d2.ready && d2.provider === provider){
+          if(d2.ready && !d2.stale && d2.provider === provider){
             clearInterval(iv); btn.disabled=false; btn.textContent='Build Embeddings';
             $('#embedProgress').style.display='none'; fetchEmbedStatus();
             toast('Embeddings ready ('+d2.count+' papers)','ok');
@@ -1773,7 +1798,9 @@ function clearAndRebuild(){
     setTimeout(buildEmbeddings, 500);
   });
 }
-document.addEventListener('DOMContentLoaded', function(){ fetchEmbedStatus(); });
+// Deliberately NOT on DOMContentLoaded: #embedStatusDot is created by renderTools(),
+// which runs in the /api/init callback. The old listener raced it and usually lost,
+// leaving the panel stuck on "Checking…". renderTools() calls this itself now.
 
 // ════════════════════ EMBEDDING GRAPH ════════════════════
 function switchGraphView(){
@@ -1911,18 +1938,11 @@ function renderTools(keyInfo){
     + '<div id="expandedTerms" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px;min-height:28px;"></div>'
     + '<div class="q-row"><input type="text" id="scraperQueryCustom" placeholder="Type custom query terms, press Enter…"><button class="btn btn-sec" onclick="addCustomQuery()">+ Add</button></div>'
     + '<div class="tool-row" style="margin-top:12px;"><label>Sources</label><div class="chk-group" style="flex-wrap:wrap;gap:8px;">'
-    + '<label class="chk-item"><input type="checkbox" id="srcArxiv" checked> arXiv</label>'
-    + '<label class="chk-item"><input type="checkbox" id="srcPubmed" checked> PubMed</label>'
-    + '<label class="chk-item"><input type="checkbox" id="srcPubmedcentral" checked> PubMed Central</label>'
-    + '<label class="chk-item"><input type="checkbox" id="srcSemanticscholar" checked> Semantic Scholar</label>'
-    + '<label class="chk-item"><input type="checkbox" id="srcCrossref"> CrossRef</label>'
-    + '<label class="chk-item"><input type="checkbox" id="srcOpenalex"> OpenAlex</label>'
-    + '<label class="chk-item"><input type="checkbox" id="srcBiorxiv"> bioRxiv</label>'
-    + '<label class="chk-item"><input type="checkbox" id="srcPsyarxiv"> PsyArXiv</label>'
-    + '<label class="chk-item"><input type="checkbox" id="srcOsf"> OSF</label>'
-    + '<label class="chk-item"><input type="checkbox" id="srcResearchgate"> ResearchGate</label>'
-    + '<label class="chk-item"><input type="checkbox" id="srcLibgen" checked> LibGen <span style="font-size:10px;color:var(--text-4);">(grey)</span></label>'
-    + '<label class="chk-item"><input type="checkbox" id="srcAnnas" checked> AnnAS <span style="font-size:10px;color:var(--text-4);">(grey)</span></label></div></div>'
+    // Rendered from ALL_SOURCES, which runScraper() also reads. Two hand-maintained
+    // copies of this list meant any divergence became a null deref at scrape time.
+    + ALL_SOURCES.map(s => '<label class="chk-item"><input type="checkbox" id="src'+s.id+'"'+(s.default?' checked':'')+'> '+esc(s.label)
+        + (s.grey?' <span style="font-size:10px;color:var(--text-4);">(grey)</span>':'')+'</label>').join('')
+    + '</div></div>'
     + '<div class="tool-row"><label>Max each</label><input type="number" id="scraperMax" value="20" min="1" max="100" style="width:74px;">'
     + '<button class="btn" onclick="runScraper()">Run Scraper</button><button class="btn btn-sec" onclick="checkScraperStatus()">Status</button></div>'
     + '<div id="scraperLog" class="log" style="display:none;"></div></div>';
@@ -1966,14 +1986,14 @@ function renderTools(keyInfo){
 
   h += '<div class="tool-section"><h3>'+svg('<rect x="2" y="4" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="6" rx="2"/><path d="M6 8h.01M6 17h.01"/>',2)+'Server</h3>'
     + '<div class="tool-row"><button class="btn btn-sec" onclick="checkServerStatus()">Check Status</button><button class="btn btn-danger" onclick="shutdownServer()">Shutdown</button><span id="serverStatusTool" style="font-size:11.5px;"></span></div>'
-    + '<div style="margin-top:10px;"><button class="btn btn-ghost btn-sm" onclick="toggleShortcutModal()">⌨  Keyboard shortcuts</button></div></div>';
+    + '<div style="margin-top:10px;"><button class="btn btn-ghost btn-sm" onclick="toggleShortcutModal()">Keyboard shortcuts</button></div></div>';
 
   h += '<div class="tool-section"><h3>'+svg('<path d="M4 4h16a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z"/><path d="M8 8h8M8 12h8M8 16h5"/>',2)+'Server Logs</h3>'
     + '<div class="tool-row"><button class="btn btn-sec" onclick="fetchLogs()">Refresh Logs</button><button class="btn btn-ghost btn-sm" onclick="clearLogs()">Clear</button><span id="logsStatus" style="font-size:11.5px;color:var(--text-4);margin-left:auto;"></span></div>'
     + '<div id="logsDisplay" class="log" style="display:none;margin-top:11px;max-height:300px;"></div></div>';
 
   $('#tools-content').innerHTML = h;
-  renderQueryTags(); syncPresetButtons(); renderSearchHistory();
+  renderQueryTags(); syncPresetButtons(); renderSearchHistory(); fetchEmbedStatus();
   const inp = $('#scraperQueryCustom');
   if(inp) inp.addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); addCustomQuery(); } });
 }
@@ -2053,9 +2073,11 @@ document.addEventListener('keydown', e=>{
   }
   if(e.key.toLowerCase()==='g' && !shortcutPrefix && !inField){ shortcutPrefix='g'; setTimeout(()=>shortcutPrefix=false,1000); return; }
   if($('#t-papers').classList.contains('active') && !inField){
-    if(e.key==='j'){ e.preventDefault(); if(selectedPaperIndex < PAPERS.length-1){ selectedPaperIndex++; openReader(selectedPaperIndex); } }
-    else if(e.key==='k'){ e.preventDefault(); if(selectedPaperIndex>0){ selectedPaperIndex--; openReader(selectedPaperIndex); } }
-    else if(e.key==='o' && selectedPaperIndex>=0){ e.preventDefault(); openReader(selectedPaperIndex); }
+    // selectedPaperIndex indexes the list actually on screen, so j/k track what you see.
+    const list = curFiltered.length ? curFiltered : PAPERS;
+    if(e.key==='j'){ e.preventDefault(); if(selectedPaperIndex < list.length-1) openReaderByPaper(list[selectedPaperIndex+1]); }
+    else if(e.key==='k'){ e.preventDefault(); if(selectedPaperIndex > 0) openReaderByPaper(list[selectedPaperIndex-1]); }
+    else if(e.key==='o' && selectedPaperIndex>=0){ e.preventDefault(); openReaderByPaper(list[selectedPaperIndex]); }
   }
 });
 
@@ -2077,7 +2099,7 @@ function boot(){
     curFiltered = PAPERS.slice();
     selectedPaperIndex = PAPERS.length?0:-1;
     renderDashboard(); renderPapers(); renderTools(keyInfo); renderChatStatus(keyInfo);
-    renderBookmarks(); initFilters(); updateNavCounts();
+    renderBookmarks(); initFilters(); updateNavCounts(); renderMultiSelectBtn();
     $('#loading-overlay').classList.add('hidden');
     // defer full paper bodies
     apiGet('/api/papers?q=', (e2, d2)=>{
