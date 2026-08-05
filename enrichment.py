@@ -8,6 +8,7 @@ import re
 import time
 import urllib.request
 import urllib.error
+import urllib.parse  # used for quote(); previously resolved only via urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Set
 
@@ -41,7 +42,15 @@ def _build_unpaywall_url(doi: str, email: str | None) -> str:
         raise ValueError("An email address must be provided for Unpaywall API requests.")
     # Normalise DOI for URL insertion – remove any surrounding ``doi:``, ``http`` etc.
     norm = _normalize_doi(doi)
-    return f"https://api.unpaywall.org/v2/{norm}?email={urllib.parse.quote(email)}"
+    # The DOI comes from CrossRef/OpenAlex and is untrusted. Require the real DOI
+    # shape and reject dot-segments, because percent-encoding alone does not help
+    # here: quote() never escapes ".", so "10.1/../../x" would survive and a URL
+    # normaliser would collapse it to a different endpoint.
+    if ".." in norm or not re.match(r"^10\.\d{4,9}/\S+$", norm):
+        raise ValueError(f"Refusing to build a request for malformed DOI: {norm!r}")
+    # safe="/" is deliberate: DOIs legitimately contain slashes and Unpaywall
+    # expects those unescaped. Everything else ("?", "#", "%", spaces) is encoded.
+    return f"https://api.unpaywall.org/v2/{urllib.parse.quote(norm, safe='/')}?email={urllib.parse.quote(email)}"
 
 
 def enrich_unpaywall(doi: str, email: str | None = None) -> Dict[str, Any]:
@@ -79,7 +88,10 @@ def enrich_unpaywall(doi: str, email: str | None = None) -> Dict[str, Any]:
         return result
 
     try:
-        with urllib.request.urlopen(url) as response:
+        # Timeout is mandatory here: server.py calls this from a request handler
+        # thread (download_pdf_with_fallback), so a hung connection pinned that
+        # worker indefinitely.
+        with urllib.request.urlopen(url, timeout=20) as response:
             if response.status != 200:
                 # Non‑200 responses are treated as failures.
                 return result

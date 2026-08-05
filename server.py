@@ -11,6 +11,8 @@ import csv
 import io
 import time
 import hashlib
+import ipaddress
+import socket
 import tempfile
 import logging
 import queue
@@ -203,16 +205,70 @@ def extract_pdf_text(pdf_path):
         pass
     return "[No PDF extraction tool available. Install pymupdf: pip install pymupdf]"
 
+MAX_PDF_BYTES = 60 * 1024 * 1024
+
+
+def is_fetchable_url(url):
+    """Reject anything that isn't a plain http(s) URL to a public host.
+
+    Every pdf_url in the corpus is copied verbatim from a third-party API response
+    or scraped HTML, and download_pdf() fetches it unattended. urllib honours
+    file:// and ftp://, so an unvalidated URL was a local-file read and an SSRF
+    into loopback/LAN services -- including this server's own API. The direct
+    branch of download_pdf_with_fallback() at least required a .pdf suffix; the
+    Unpaywall branch did not, and "file:///c:/x.pdf" satisfies it anyway.
+
+    Returns (ok, reason).
+    """
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except Exception:
+        return False, "unparseable URL"
+    if parts.scheme not in ("http", "https"):
+        return False, f"scheme {parts.scheme or '(none)'} not allowed"
+    host = parts.hostname
+    if not host:
+        return False, "no host"
+    try:
+        infos = socket.getaddrinfo(host, parts.port or (443 if parts.scheme == "https" else 80),
+                                   proto=socket.IPPROTO_TCP)
+    except socket.gaierror as e:
+        return False, f"DNS failure: {e}"
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False, "unresolvable address"
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return False, f"non-public address {ip}"
+    return True, ""
+
+
 def download_pdf(url, paper_id):
     safe_id = re.sub(r'[^a-zA-Z0-9._-]', '_', str(paper_id))
     pdf_path = PDF_DIR / f"{safe_id}.pdf"
     if pdf_path.exists():
         return pdf_path
+    ok, reason = is_fetchable_url(url)
+    if not ok:
+        print(f"  PDF download refused for {paper_id}: {reason}")
+        return None
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=60) as resp:
-            data = resp.read()
+            # Bounded read: the old resp.read() had no cap, so one oversized or
+            # endless response could exhaust memory.
+            data = resp.read(MAX_PDF_BYTES + 1)
+            if len(data) > MAX_PDF_BYTES:
+                print(f"  PDF download refused for {paper_id}: larger than {MAX_PDF_BYTES} bytes")
+                return None
             if len(data) < 1000:
+                return None
+            if not data.startswith(b"%PDF-"):
+                # Mirrors and paywalls serve HTML block pages with a .pdf URL; storing
+                # one means the extractor and the LLM later treat markup as a paper.
+                print(f"  PDF download refused for {paper_id}: not a PDF (no %PDF- header)")
                 return None
             with open(pdf_path, "wb") as f:
                 f.write(data)
@@ -1516,11 +1572,20 @@ def _ensure_behavioural_query(query_key):
         return query_key
     return f"({BEHAVIOURAL_QUERY_PREFIX}) AND ({query_key})"
 
-def run_scraper(query_key, count, sources=None):
+def run_scraper(query_key, count, sources=None, manage_flag=True):
+    """Scrape one query group.
+
+    manage_flag=False when called from _run_scraper_queue, which owns the shared
+    running flag and the accumulated output across a multi-query run.
+    """
     global scraper_status, papers_global, analysis_global
     behavioural_query = _ensure_behavioural_query(query_key)
-    scraper_status["running"] = True
-    scraper_status["output"] = f"Starting scrape: {query_key} -> {behavioural_query[:100]}... ({count} papers)\n"
+    header = f"Starting scrape: {query_key} -> {behavioural_query[:100]}... ({count} papers)\n"
+    if manage_flag:
+        scraper_status["running"] = True
+        scraper_status["output"] = header
+    else:
+        scraper_status["output"] += header
     scraper_status["returncode"] = None
     log_scraper(f"Starting scrape: {query_key} ({count} papers)")
     log_scraper(f"Behavioural query: {behavioural_query}")
@@ -1592,7 +1657,48 @@ def run_scraper(query_key, count, sources=None):
         scraper_status["output"] += err_msg
         scraper_status["returncode"] = -1
         log_scraper(f"Error: {e}")
-    scraper_status["running"] = False
+    if manage_flag:
+        scraper_status["running"] = False
+
+
+def _run_scraper_queue(queries, count, sources=None):
+    """Run query groups one at a time on a single worker thread.
+
+    /api/scraper/run used to start one thread per query, all sharing the single
+    global scraper_status dict. Consequences, with 17 presets selectable in the UI:
+      - output interleaved and returncode raced between threads
+      - the first query to finish set running=False, so the UI reported "Scraper
+        finished" and stopped polling while the others were still going
+      - N concurrent scraper.py subprocesses hammered the same APIs, which defeats
+        any per-process rate limiting and invites 429s
+      - N concurrent rebuilds of papers_global / analysis_global for ~1697 papers
+    """
+    scraper_status["running"] = True
+    scraper_status["output"] = ""
+    scraper_status["returncode"] = None
+    failed = 0
+    try:
+        for i, q in enumerate(queries, 1):
+            banner = f"\n=== [{i}/{len(queries)}] {q} ===\n"
+            scraper_status["output"] += banner
+            log_scraper(banner.strip())
+            try:
+                run_scraper(q, count, sources, manage_flag=False)
+            except Exception as e:
+                failed += 1
+                msg = f"\nQuery {q!r} failed: {type(e).__name__}: {e}"
+                scraper_status["output"] += msg
+                log_scraper(msg.strip())
+                continue
+            if scraper_status.get("returncode") not in (0, None):
+                failed += 1
+        # Don't let the UI claim success when some groups failed.
+        if failed:
+            scraper_status["output"] += f"\n{failed} of {len(queries)} query group(s) failed."
+            if scraper_status.get("returncode") == 0:
+                scraper_status["returncode"] = 1
+    finally:
+        scraper_status["running"] = False
 
 scraper_status = {"running": False, "output": "", "returncode": None}
 
@@ -2012,10 +2118,11 @@ class Handler(SimpleHTTPRequestHandler):
                 if scraper_status.get("running", False):
                     self._json({"error": "Scraper is already running."}, status=409)
                     return
-                for q in queries:
-                    t = threading.Thread(target=run_scraper, args=(q, max_count, sources), daemon=True)
-                    t.start()
-                self._json({"ok": True, "message": f"Started scraper for {len(queries)} query group(s) ({max_count} papers each)."})
+                # One worker, queries sequential -- see _run_scraper_queue for why.
+                t = threading.Thread(target=_run_scraper_queue,
+                                     args=(list(queries), max_count, sources), daemon=True)
+                t.start()
+                self._json({"ok": True, "message": f"Queued {len(queries)} query group(s), {max_count} papers each, running one at a time."})
 
             elif path == "/api/papers_by_ids":
                 ids = data.get("ids", [])

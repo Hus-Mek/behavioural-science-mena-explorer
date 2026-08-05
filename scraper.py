@@ -14,8 +14,101 @@ import re
 import argparse
 import shutil
 import random
+import urllib.parse
 from pathlib import Path
 from collections import Counter
+
+
+class PoliteSession:
+    """requests.Session wrapper that paces requests per host and honours 429.
+
+    Only arXiv (3s) and PubMed/PMC (0.5s) throttled themselves; the other nine
+    sources fired with no delay at all. A 429 was handled by printing the status
+    code and returning [], so a rate-limited source looked like "no results" --
+    which is why data/raw holds several 2-byte "[]" files.
+
+    Pacing lives here rather than at the 14 self.session.get() call sites so every
+    source gets it, including any added later.
+    """
+
+    # Minimum seconds between requests to a host. NCBI allows ~3/s unauthenticated;
+    # CrossRef and Semantic Scholar throttle hard and ask for a contact address.
+    _HOST_INTERVAL = {
+        "export.arxiv.org":         3.0,
+        "eutils.ncbi.nlm.nih.gov":  0.4,
+        "api.semanticscholar.org":  1.2,
+        "api.crossref.org":         1.0,
+        "api.openalex.org":         0.2,
+        "api.biorxiv.org":          0.5,
+        "api.osf.io":               0.5,
+    }
+    _DEFAULT_INTERVAL = 1.0
+    # Capped well under the parent's 300s kill so one 429 can't consume the budget.
+    _MAX_RETRY_WAIT = 15.0
+
+    TOOL_NAME = "BehaviouralScienceMENAExplorer"
+
+    def __init__(self, session, contact_email=""):
+        self._session = session
+        self._last_request = {}
+        self.contact_email = contact_email
+
+    def __getattr__(self, name):
+        # Delegate headers, close, mount, etc. to the real session.
+        return getattr(self._session, name)
+
+    @staticmethod
+    def _host(url):
+        return (urllib.parse.urlsplit(url).hostname or "").lower()
+
+    def _identify(self, host, kwargs):
+        """Add the identification param each API asks for.
+
+        CrossRef and OpenAlex route requests carrying `mailto` into a faster,
+        less aggressively throttled "polite pool"; NCBI asks for tool+email.
+        Without these, all three treat the client as anonymous.
+        """
+        if not self.contact_email:
+            return
+        if host in ("api.crossref.org", "api.openalex.org"):
+            extra = {"mailto": self.contact_email}
+        elif host == "eutils.ncbi.nlm.nih.gov":
+            extra = {"tool": self.TOOL_NAME, "email": self.contact_email}
+        else:
+            return
+        params = dict(kwargs.get("params") or {})
+        for key, value in extra.items():
+            params.setdefault(key, value)
+        kwargs["params"] = params
+
+    def _pace(self, host):
+        interval = self._HOST_INTERVAL.get(host, self._DEFAULT_INTERVAL)
+        last = self._last_request.get(host)
+        if last is not None:
+            wait = interval - (time.monotonic() - last)
+            if wait > 0:
+                time.sleep(wait)
+        self._last_request[host] = time.monotonic()
+
+    def get(self, url, **kwargs):
+        host = self._host(url)
+        self._identify(host, kwargs)
+        self._pace(host)
+        r = self._session.get(url, **kwargs)
+        if r.status_code != 429:
+            return r
+        wait = self._DEFAULT_INTERVAL
+        retry_after = r.headers.get("Retry-After")
+        if retry_after:
+            try:
+                wait = float(retry_after)
+            except (TypeError, ValueError):
+                pass  # HTTP-date form; fall back to the default
+        wait = max(0.0, min(wait, self._MAX_RETRY_WAIT))
+        print(f"  429 from {host}: waiting {wait:.1f}s, retrying once")
+        time.sleep(wait)
+        self._pace(host)
+        return self._session.get(url, **kwargs)
 
 try:
     from grey_sources import libgen_search, annas_archive_search
@@ -234,10 +327,25 @@ class MultiSourceScraper:
         self.data_dir = Path("data/raw")
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.delay = delay
-        self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": "Hermes-Agent/1.0 (research; contact: academic)"
-        })
+        # CONTACT_EMAIL identifies this client to NCBI and CrossRef, both of which
+        # ask for a real address and throttle anonymous clients hardest. Left unset
+        # by default rather than hardcoding a personal address into a public repo --
+        # set SCRAPER_CONTACT_EMAIL, or contact_email in config.json.
+        contact = os.environ.get("SCRAPER_CONTACT_EMAIL", "").strip()
+        if not contact:
+            try:
+                with open("config.json", encoding="utf-8") as f:
+                    contact = (json.load(f).get("contact_email") or "").strip()
+            except Exception:
+                contact = ""
+        self.contact_email = contact
+        ua = "BehaviouralScienceMENAExplorer/1.0 (academic research"
+        ua += f"; contact: {contact})" if contact else "; no contact configured)"
+        if not contact:
+            print("  Note: no contact email set (SCRAPER_CONTACT_EMAIL or config.json"
+                  " contact_email). NCBI and CrossRef throttle anonymous clients hardest.")
+        self.session = PoliteSession(requests.Session(), contact_email=contact)
+        self.session.headers.update({"User-Agent": ua})
 
     def _pbar(self, total, desc):
         if HAS_TQDM:
@@ -268,12 +376,12 @@ class MultiSourceScraper:
                 'sortBy': 'submittedDate', 'sortOrder': 'descending'
             }
             try:
-                r = self.session.get("http://export.arxiv.org/api/query", params=params, timeout=30)
+                r = self.session.get("https://export.arxiv.org/api/query", params=params, timeout=30)
             except (Timeout, ConnectionError) as e:
                 print(f"  arXiv network error (retrying once): {e}")
                 time.sleep(self.delay * 2)
                 try:
-                    r = self.session.get("http://export.arxiv.org/api/query", params=params, timeout=60)
+                    r = self.session.get("https://export.arxiv.org/api/query", params=params, timeout=60)
                 except (Timeout, ConnectionError) as e2:
                     print(f"  arXiv error after retry: {e2}")
                     break
@@ -561,7 +669,11 @@ class MultiSourceScraper:
                     'search': query,
                     'per-page': min(max_results, 200),
                     'sort': 'publication_date:desc',
-                    'select': 'id,doi,title,authorships,publication_year,publication_date,abstract_inverted_index,primary_location,locations,host_venue,type,concepts'
+                    # No host_venue: OpenAlex removed it, and asking for an invalid
+                    # select field 400s the whole request -- which is why this source
+                    # silently returned zero papers on every scrape. Journal name now
+                    # comes from primary_location.source, its documented replacement.
+                    'select': 'id,doi,title,authorships,publication_year,publication_date,abstract_inverted_index,primary_location,locations,type,concepts'
                 },
                 timeout=30
             )
@@ -606,7 +718,7 @@ class MultiSourceScraper:
                     'summary': abstract, 'published': pub_date,
                     'pdf_url': pdf_url,
                     'source': 'OpenAlex',
-                    'journal': item.get('host_venue', {}).get('display_name') if item.get('host_venue') else '',
+                    'journal': ((item.get('primary_location') or {}).get('source') or {}).get('display_name') or '',
                     'type': item.get('type', '')
                 })
                 pbar.update(1)
