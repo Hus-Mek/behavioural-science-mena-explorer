@@ -120,11 +120,17 @@ EMBEDDING_BATCH_SIZE = 100
 GEMINI_EMBEDDING_DIM = 3072
 
 LLM_BASE_URL = "https://openrouter.ai/api/v1"
-LLM_MODEL = "poolside/laguna-m.1:free"
+# Every model below was verified to return a completion on 2026-08-05.
+# The previous chain had three dead entries out of four: laguna-m.1 and
+# gemini-2.0-flash-001 no longer exist ("No endpoints found"), and qwen3-coder:free
+# became paid-only. Only gpt-oss-20b still answered, so every LLM call burned a
+# 404 round trip on the dead primary before falling through to it.
+# laguna-s-2.1 is the successor to the laguna-m.1 this project was built around.
+LLM_MODEL = "poolside/laguna-s-2.1:free"
 LLM_FALLBACK_MODELS = [
     "openai/gpt-oss-20b:free",
-    "qwen/qwen3-coder:free",
-    "google/gemini-2.0-flash-001",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "inclusionai/ling-3.0-flash:free",
 ]
 
 PROMPTS_FILE = ROOT / "prompts.json"
@@ -1674,13 +1680,18 @@ class Handler(SimpleHTTPRequestHandler):
                     except Exception:
                         pass
                 _load_embeddings()
-                ready = _paper_embeddings is not None and len(_paper_embedding_ids) > 0
+                has_embeddings = _paper_embeddings is not None and len(_paper_embedding_ids) > 0
+                total = len(papers_global) if papers_global else 0
+                count = len(_paper_embedding_ids) if has_embeddings else 0
+                # Only "ready" if we have embeddings for ALL papers
+                ready = has_embeddings and count == total and total > 0
                 self._json({
                     "ready": ready,
+                    "stale": has_embeddings and count < total,
                     "provider": meta.get("provider", EMBEDDING_PROVIDER),
                     "model": meta.get("model", ""),
-                    "count": len(_paper_embedding_ids) if ready else 0,
-                    "total_papers": len(papers_global) if papers_global else 0,
+                    "count": count,
+                    "total_papers": total,
                 })
                 return
 
@@ -1812,31 +1823,48 @@ class Handler(SimpleHTTPRequestHandler):
             elif path == "/":
                 path = "/index.html"
 
-            paper_graph_path = ROOT / "graphify-out" / "paper_graph.html"
-            if path == "/paper_graph.html" and paper_graph_path.exists():
-                local_path = paper_graph_path
-                ct = "text/html; charset=utf-8"
-            else:
-                try:
-                    local_path = ROOT / path.lstrip("/")
-                    if path.endswith(".html"):
-                        ct = "text/html; charset=utf-8"
-                    elif path.endswith(".js"):
-                        ct = "application/javascript; charset=utf-8"
-                    elif path.endswith(".css"):
-                        ct = "text/css; charset=utf-8"
-                    else:
-                        ct = "application/octet-stream"
-                    self.send_response(200)
-                    self.send_header("Content-Type", ct)
-                    self.send_header("Cache-Control", "no-store, must-revalidate")
-                    self.send_header("Connection", "close")
-                    self.send_header("Access-Control-Allow-Origin", "*")
-                    self.end_headers()
-                    with open(local_path, "rb") as f:
-                        self.wfile.write(f.read())
-                except FileNotFoundError:
+            # Static files come from an explicit allow-list.
+            #
+            # This replaces `local_path = ROOT / path.lstrip("/")`, which had no
+            # containment check and served any file the process could read:
+            #   GET /config.json          -> both API keys in plaintext
+            #   GET /server.py            -> full source
+            #   GET /.git/config          -> repo internals
+            #   GET /../../../Windows/... -> arbitrary file read
+            # (Browsers normalise "..", so this needed a socket client to reach --
+            # which is exactly what an attacker uses.)
+            #
+            # It also fixes a hang: the old /paper_graph.html branch assigned
+            # local_path and ct but the send lived in the else, so the Graph tab's
+            # default view got an empty response (HTTP 000, 0 bytes).
+            static = {
+                "/index.html":           ROOT / "index.html",
+                "/embedding_graph.html": ROOT / "embedding_graph.html",
+                "/paper_graph.html":     ROOT / "graphify-out" / "paper_graph.html",
+            }
+            target = static.get(path)
+            if target is None:
+                self.send_error(404)
+                return
+            try:
+                # Belt and braces: even an allow-listed entry must resolve inside ROOT.
+                resolved = target.resolve()
+                if not resolved.is_file() or ROOT.resolve() not in resolved.parents:
                     self.send_error(404)
+                    return
+                body = resolved.read_bytes()
+            except (FileNotFoundError, OSError):
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store, must-revalidate")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self._headers_sent = True
+            self.wfile.write(body)
+            return
 
         except ConnectionAbortedError:
             pass
@@ -1948,7 +1976,18 @@ class Handler(SimpleHTTPRequestHandler):
         global _paper_embeddings, _paper_embedding_ids
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
-        content_length = int(self.headers.get("Content-Length", 0))
+        # int() on the raw header sat outside every try block: "Content-Length: abc"
+        # raised ValueError, killing the worker thread with no response at all. An
+        # oversized value was also an unbounded read straight into memory.
+        MAX_BODY = 32 * 1024 * 1024
+        try:
+            content_length = int(self.headers.get("Content-Length", 0) or 0)
+        except (TypeError, ValueError):
+            self._json({"error": "Malformed Content-Length header"}, status=400)
+            return
+        if content_length < 0 or content_length > MAX_BODY:
+            self._json({"error": f"Request body too large (max {MAX_BODY} bytes)"}, status=413)
+            return
         body = self.rfile.read(content_length) if content_length else b"{}"
         try:
             data = json.loads(body) if body else {}
@@ -2346,7 +2385,10 @@ def serve(port=3000):
     # long-running call (LLM, scraper, PDF extraction) can never block one
     # another. Single-threaded HTTPServer froze the whole server whenever one
     # socket stalled, which surfaced as "Failed to connect to server".
-    server = ThreadingHTTPServer(("", port), Handler)
+    # Bind loopback only. ("", port) binds 0.0.0.0, which exposed this server --
+    # and every file it would serve, plus unauthenticated /api/shutdown and
+    # LLM-spending endpoints -- to every host on the local network.
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     server.daemon_threads = True
     server.allow_reuse_address = True
 
