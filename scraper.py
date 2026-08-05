@@ -9,6 +9,7 @@ from requests.exceptions import Timeout, ConnectionError, RequestException
 import xml.etree.ElementTree as ET
 import time
 import os
+import sys
 import json
 import re
 import argparse
@@ -17,6 +18,16 @@ import random
 import urllib.parse
 from pathlib import Path
 from collections import Counter
+
+# server.py runs this with stdout=subprocess.PIPE, and a piped stdout on Windows
+# defaults to cp1252. Printing the query text (progress-bar labels, the mode line)
+# then raised UnicodeEncodeError on any Arabic query -- fatal, exit 1, zero papers,
+# in a tool whose entire purpose is MENA research. Force UTF-8 with replacement.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
 
 
 class PoliteSession:
@@ -346,6 +357,11 @@ class MultiSourceScraper:
                   " contact_email). NCBI and CrossRef throttle anonymous clients hardest.")
         self.session = PoliteSession(requests.Session(), contact_email=contact)
         self.session.headers.update({"User-Agent": ua})
+        # Cumulative across every query in a run, so the exit code can distinguish
+        # "every source failed" (an error) from "nothing new found" (a normal result).
+        self.source_results = {}
+        self.sources_ok = set()
+        self.sources_failed = {}
 
     def _pbar(self, total, desc):
         if HAS_TQDM:
@@ -354,14 +370,38 @@ class MultiSourceScraper:
             return _SimplePbar(total, desc)
 
     def _search_all_sources(self, query, sources, max_results, arxiv_query=None):
+        """Query each source, isolating failures and reporting per-source counts.
+
+        Each source only caught (Timeout, ConnectionError, RequestException), so any
+        other exception -- a TypeError from `"authors": null`, a UnicodeEncodeError,
+        an IndexError on malformed JSON -- propagated out of here and aborted the
+        whole run, discarding every paper already collected from earlier sources.
+
+        The old loop also printed just "  {src}..." with no count, so a source that
+        403'd, timed out or returned nothing looked exactly like one that worked.
+        self.source_results records the outcome so the caller can tell "everything
+        failed" (a real error) from "nothing new found" (a normal result).
+        """
         papers = []
+        self.source_results = {}
         for src in sources:
             method_name = self.SOURCE_METHODS.get(src)
             if method_name is None:
+                print(f"  {src}: unknown source, skipped")
+                self.source_results[src] = "skipped"
                 continue
-            print(f"  {src}...")
             q = arxiv_query if src == 'arxiv' and arxiv_query else query
-            papers.extend(getattr(self, method_name)(q, max_results))
+            try:
+                got = getattr(self, method_name)(q, max_results) or []
+            except Exception as e:
+                self.source_results[src] = f"FAILED: {type(e).__name__}: {e}"
+                self.sources_failed[src] = f"{type(e).__name__}: {e}"
+                print(f"  {src}: FAILED ({type(e).__name__}: {e})")
+                continue
+            self.source_results[src] = len(got)
+            self.sources_ok.add(src)
+            print(f"  {src}: {len(got)} results")
+            papers.extend(got)
         return papers
 
     # ── arXiv ─────────────────────────────────────────────────────────────
@@ -540,7 +580,7 @@ class MultiSourceScraper:
                 if s is None or not isinstance(s, dict):
                     continue
                 title = s.get('title', 'No title') or 'No title'
-                authors = [a.get('name', '') for a in s.get('authors', []) if isinstance(a, dict)]
+                authors = [a.get('name', '') for a in (s.get('authors') or []) if isinstance(a, dict)]
                 abstract = s.get('abstract') or ""
                 pub_date = s.get('pubdate', s.get('sortpubdate', ''))
                 pdf_url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/PMC{pmcid}/pdf/"
@@ -587,9 +627,9 @@ class MultiSourceScraper:
                 paper_dict = {
                     'id': p.get('paperId', 'unknown'),
                     'title': p.get('title', '') or '',
-                    'authors': [a.get('name', '') for a in p.get('authors', []) if isinstance(a, dict)],
+                    'authors': [a.get('name', '') for a in (p.get('authors') or []) if isinstance(a, dict)],
                     'summary': p.get('abstract') or '',
-                    'published': p.get('publicationDate') or f"{p.get('year', 2024)}-01-01",
+                    'published': p.get('publicationDate') or f"{p.get('year') or 2024}-01-01",
                     'pdf_url': p.get('url') or '',
                     'source': 'SemanticScholar',
                     'venue': p.get('venue', '')
@@ -713,7 +753,7 @@ class MultiSourceScraper:
                             pdf_url = loc.get('pdf_url')
                             break
                 papers.append({
-                    'id': f"OpenAlex:{item.get('id', '').split('/')[-1]}:{doi}" if doi else f"OpenAlex:{item.get('id', '').split('/')[-1]}",
+                    'id': f"OpenAlex:{(item.get('id') or '').split('/')[-1]}:{doi}" if doi else f"OpenAlex:{(item.get('id') or '').split('/')[-1]}",
                     'title': title, 'authors': authors,
                     'summary': abstract, 'published': pub_date,
                     'pdf_url': pdf_url,
@@ -747,12 +787,12 @@ class MultiSourceScraper:
                 print(f"  bioRxiv JSON parse error: {e}")
                 pbar.close()
                 return []
-            for item in data.get('collection', [])[:max_results]:
+            for item in (data.get('collection') or [])[:max_results]:
                 papers.append({
                     'id': f"bioRxiv:{item.get('doi', '')}",
-                    'title': item.get('title', ''),
-                    'authors': [a.strip() for a in item.get('authors', '').split(';') if a.strip()],
-                    'summary': item.get('abstract', ''),
+                    'title': item.get('title') or '',
+                    'authors': [a.strip() for a in (item.get('authors') or '').split(';') if a.strip()],
+                    'summary': item.get('abstract') or '',
                     'published': item.get('date', ''),
                     'pdf_url': f"https://www.biorxiv.org/content/{item.get('doi', '')}.full.pdf" if item.get('doi') else '',
                     'pdf_source': 'biorxiv',
@@ -798,8 +838,8 @@ class MultiSourceScraper:
                 if isinstance(links, dict):
                     pdf_url = links.get('download', '')
                 papers.append({
-                    'id': f"PsyArXiv:{item.get('id', '')}",
-                    'title': attrs.get('title', ''),
+                    'id': f"PsyArXiv:{item.get('id') or ''}",
+                    'title': attrs.get('title') or '',
                     'authors': [],
                     'summary': attrs.get('description', ''),
                     'published': attrs.get('date_created', ''),
@@ -845,8 +885,8 @@ class MultiSourceScraper:
                 if isinstance(links, dict):
                     pdf_url = links.get('download', '')
                 papers.append({
-                    'id': f"OSF:{item.get('id', '')}",
-                    'title': attrs.get('title', ''),
+                    'id': f"OSF:{item.get('id') or ''}",
+                    'title': attrs.get('title') or '',
                     'authors': [],
                     'summary': attrs.get('description', ''),
                     'published': attrs.get('date_created', ''),
@@ -914,7 +954,7 @@ class MultiSourceScraper:
             for item in results:
                 papers.append({
                     'id': f"LibGen:{item.get('md5', '')[:16]}",
-                    'title': item.get('title', ''),
+                    'title': item.get('title') or '',
                     'authors': item.get('authors', '').split(';') if item.get('authors') else [],
                     'summary': '',
                     'published': '',
@@ -942,7 +982,7 @@ class MultiSourceScraper:
             for item in results:
                 papers.append({
                     'id': f"Anna:{item.get('md5', '')[:16]}",
-                    'title': item.get('title', ''),
+                    'title': item.get('title') or '',
                     'authors': [],
                     'summary': '',
                     'published': '',
@@ -992,14 +1032,26 @@ class MultiSourceScraper:
         return unique
 
     def save(self, papers, tag):
+        """Write the run's papers, updating papers_{tag}.json only if non-empty.
+
+        This used to json.dump unconditionally, then os.remove the canonical file
+        and copy the new one over it. An empty run therefore (a) wrote a 2-byte
+        "[]" snapshot and (b) DESTROYED the previous good scrape for that tag --
+        which is why data/raw accumulated 2-byte files. Since every source
+        returning [] is indistinguishable from a rate-limited or crashed run, a
+        single bad rerun silently deleted real results.
+        """
+        if not papers:
+            print(f"  No papers collected; leaving papers_{tag}.json untouched.")
+            return None
         ts = int(time.time())
         out = self.data_dir / f"papers_{tag}_{ts}.json"
         with open(out, 'w', encoding='utf-8') as f:
             json.dump(papers, f, indent=2, ensure_ascii=False)
+        # os.replace is atomic, so a crash can't leave the canonical file missing.
         canonical = self.data_dir / f"papers_{tag}.json"
-        if canonical.exists():
-            os.remove(canonical)
-        shutil.copy(out, canonical)
+        shutil.copy(out, canonical.with_suffix(".json.tmp"))
+        os.replace(canonical.with_suffix(".json.tmp"), canonical)
         return out
 
     # ── Run all queries ───────────────────────────────────────────────────
@@ -1139,7 +1191,23 @@ if __name__ == "__main__":
     tag = args.tag or args.query or args.group or args.custom or "multi"
     tag = re.sub(r'[^A-Za-z0-9_\-]+', '_', tag)[:80] or "multi"
     out = scraper.save(all_papers, tag)
-    print(f"\nSaved {len(all_papers)} unique papers to {out}")
+    if out:
+        print(f"\nSaved {len(all_papers)} unique papers to {out}")
     print(f"Mode: {mode_label}")
     if selected_group:
         print(f"Group: {selected_group}")
+
+    if scraper.sources_failed:
+        print("\nFailed sources:")
+        for src, err in sorted(scraper.sources_failed.items()):
+            print(f"  {src}: {err}")
+
+    # Exit non-zero only when nothing worked. server.py treats returncode 0 as
+    # success and reloads the corpus on that basis, and the script previously never
+    # called sys.exit at all -- so a run where every single source failed was
+    # logged as "Scraper completed successfully". A run where sources answered but
+    # found nothing new is a legitimate 0.
+    if not scraper.sources_ok:
+        print("\nEvery source failed; nothing was saved.")
+        sys.exit(1)
+    sys.exit(0)
