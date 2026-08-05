@@ -102,12 +102,7 @@ a{color:inherit;}
 
   border-right:1px solid var(--border);z-index:50;
 }
-.brand{display:flex;align-items:center;gap:11px;padding:6px 8px 16px;}
-.brand .mark{
-  width:38px;height:38px;border-radius:11px;flex-shrink:0;
-  background:var(--accent);display:grid;place-items:center;
-  color:#fff;font-family:var(--serif);font-weight:600;font-size:19px;
-}
+.brand{display:flex;align-items:center;gap:11px;padding:8px 8px 18px;}
 .brand .bt{display:flex;flex-direction:column;line-height:1.15;min-width:0;}
 .brand .bt b{font-size:13.5px;font-weight:600;color:var(--text);letter-spacing:-.01em;}
 .brand .bt span{font-size:10.5px;color:var(--text-4);letter-spacing:.04em;text-transform:uppercase;}
@@ -529,7 +524,6 @@ html[data-theme="light"] .log{background:oklch(0.2 0.02 275 / 0.06);}
   <!-- SIDEBAR -->
   <aside class="side" id="side">
     <div class="brand">
-      <div class="mark">ب</div>
       <div class="bt"><b>MENA Explorer</b><span>Behavioural Science</span></div>
     </div>
     <nav class="nav" id="mainNav" role="tablist"></nav>
@@ -1414,9 +1408,11 @@ let papersSelectedIds = [];
 function renderMultiSelectBtn(){
   const btn = $('#papersMultiSelectBtn'); if(!btn) return;
   btn.classList.toggle('on', papersMultiSelectMode);
+  // check-square = start selecting, X = leave. Unambiguous pair; a bare square read as
+  // an empty box at 15px, and a bare tick was confusable with the "Selected" source icon.
   btn.innerHTML = papersMultiSelectMode
-    ? svg('<path d="M20 6 9 17l-5-5"/>',1.8) + 'Exit select mode'
-    : svg('<rect x="3" y="3" width="18" height="18" rx="2.5"/>',1.8) + 'Select mode';
+    ? svg('<path d="M18 6 6 18M6 6l12 12"/>',1.8) + 'Exit select mode'
+    : svg('<path d="M21 11.5V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/><path d="m8 11 3.5 3.5L21 5"/>',1.8) + 'Select mode';
 }
 function exitPapersMultiSelect(){
   papersMultiSelectMode = false;
