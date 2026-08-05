@@ -39,8 +39,8 @@ Session note from YYYY-MM-DD. [Brief summary]
 
 ## Project Context
 - **Location:** `C:\Users\USER\localled`
-- **Port:** 3000
-- **LLM:** poolside/laguna-m.1:free (reasoning model — needs max_tokens=2000+, timeout=300s)
+- **Port:** 3000 (binds 127.0.0.1 only — do NOT change back to `("", port)`, that exposed config.json and both API keys to the LAN)
+- **LLM:** poolside/laguna-s-2.1:free (reasoning model — needs max_tokens=2000+, timeout=300s). Verified live 2026-08-05; the previous `laguna-m.1:free` 404s ("No endpoints found"), as do `qwen3-coder:free` (paid-only now) and `gemini-2.0-flash-001`. Re-verify the chain against `https://openrouter.ai/api/v1/models` when AI features misbehave — free model IDs rot without warning.
 
 ### Key Gotchas
 - Reasoning model returns `content: null` when max_tokens too low — always check `reasoning` field fallback
