@@ -131,6 +131,9 @@ LLM_BASE_URL = "https://openrouter.ai/api/v1"
 # Chat context limits. One constant so the prompt, the citation validator and the
 # papers_used payload can never describe different lists.
 MAX_CONTEXT_PAPERS = 30
+# Neighbours each paper keeps in the similarity graph. See build_embedding_graph
+# for why this replaced an absolute cosine threshold.
+GRAPH_TOP_K = 8
 MAX_HISTORY_TURNS = 20
 MAX_HISTORY_CHARS = 8000
 
@@ -610,7 +613,22 @@ EMBEDDING_GRAPH_CACHE = ROOT / "data" / "embedding_graph.json"
 KEYWORD_GRAPH_PATH = ROOT / "graphify-out" / "paper_graph.json"
 MERGED_GRAPH_CACHE = ROOT / "data" / "merged_graph.json"
 
-def build_embedding_graph(threshold=0.65):
+def build_embedding_graph(threshold=None, top_k=None):
+    """Build a k-nearest-neighbour similarity graph over the paper embeddings.
+
+    Absolute thresholds do not work on these vectors. Measured over 179,700 random
+    pairs of the live corpus, cosine similarity is: p25 0.602, median 0.626, p95
+    0.708. Unrelated papers already sit at ~0.63, so the old default of 0.65 kept
+    28% of ALL pairs (avg degree 474) and the 0.70 the handler passed kept 6.5%
+    (avg degree ~102, 76k edges). That is not a graph -- the d3 force layout never
+    produced a single SVG element, and at that density it could only ever render as
+    one blob.
+
+    So each paper keeps its own top_k most similar neighbours instead. Rank is
+    meaningful even when the absolute scale is not, every node gets edges, and the
+    result does not need re-tuning if the embedding provider changes. `threshold`
+    is kept as an optional floor for callers that want one.
+    """
     import numpy as np
     _load_embeddings()
     embs, paper_ids = embedding_snapshot()
@@ -618,45 +636,96 @@ def build_embedding_graph(threshold=0.65):
         print("  Not enough embeddings to build graph.")
         return None
 
-    print(f"  Computing embedding similarity matrix ({len(paper_ids)} papers)...")
+    k = GRAPH_TOP_K if top_k is None else max(1, min(int(top_k), 50))
+    n = len(paper_ids)
+    k = min(k, n - 1)
+    print(f"  Building kNN similarity graph (n={n}, k={k})...")
+
+    # float32 and an in-place normalise: the old code held three n x n float64
+    # arrays at once (dot product, norms*norms.T, and the quotient), which is
+    # ~2.4GB of transient at 10k papers. Normalising once means the dot product
+    # alone is the cosine similarity.
+    embs = np.asarray(embs, dtype=np.float32)
     norms = np.linalg.norm(embs, axis=1, keepdims=True)
-    sim_matrix = np.dot(embs, embs.T) / (norms * norms.T)
-    np.fill_diagonal(sim_matrix, 0)
+    np.divide(embs, np.maximum(norms, 1e-12), out=embs)
+    zero_rows = int((norms.ravel() <= 1e-12).sum())
+    if zero_rows:
+        print(f"  Warning: {zero_rows} zero-norm embedding(s) excluded.")
 
-    # Union-Find for connected components (community detection)
-    parent = list(range(len(paper_ids)))
-    def _find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-    def _union(x, y):
-        px, py = _find(x), _find(y)
-        if px != py:
-            parent[px] = py
+    sim_matrix = embs @ embs.T
+    np.fill_diagonal(sim_matrix, -1.0)  # never let a paper be its own neighbour
 
+    # Adjacency is accumulated as edges are chosen, so a weight always belongs to
+    # the pair it was computed from. Union-find went away with the switch to label
+    # propagation: on a kNN graph everything lands in one connected component, so
+    # counting components told us nothing.
+    adjacency = [[] for _ in range(n)]
+
+    # Each row keeps its k best neighbours. argpartition is O(n) per row rather
+    # than a full sort. Pairs are de-duplicated so an edge appears once even when
+    # both endpoints choose each other.
+    floor = float(threshold) if threshold is not None else None
+    seen_pairs = set()
     edges = []
-    rows, cols = np.where(sim_matrix > threshold)
-    for r, c in zip(rows, cols):
-        if r < c:
-            ri, ci = int(r), int(c)
-            _union(ri, ci)
+    neighbour_idx = np.argpartition(-sim_matrix, k - 1, axis=1)[:, :k]
+    for ri in range(n):
+        for ci in neighbour_idx[ri]:
+            ci = int(ci)
+            if ci == ri:
+                continue
+            sim = float(sim_matrix[ri, ci])
+            if not np.isfinite(sim) or sim <= -1.0:
+                continue
+            if floor is not None and sim < floor:
+                continue
+            pair = (ri, ci) if ri < ci else (ci, ri)
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            adjacency[pair[0]].append((pair[1], sim))
+            adjacency[pair[1]].append((pair[0], sim))
             edges.append({
-                "source": paper_ids[ri],
-                "target": paper_ids[ci],
-                "weight": round(float(sim_matrix[ri, ci]), 4),
+                "source": paper_ids[pair[0]],
+                "target": paper_ids[pair[1]],
+                "weight": round(sim, 4),
                 "type": "semantic"
             })
 
-    # Assign community IDs
-    comp_map = {}
-    labels = []
-    for i in range(len(paper_ids)):
-        root = _find(i)
-        if root not in comp_map:
-            comp_map[root] = len(comp_map)
-        labels.append(comp_map[root])
-    n_components = len(comp_map)
+    # Communities by label propagation, not connected components.
+    #
+    # A kNN graph is essentially always connected, so counting components now
+    # returns 1 -- and since the renderer colours nodes by community, every node
+    # would come out the same colour. Label propagation finds actual clusters
+    # inside a connected graph: each node repeatedly adopts the commonest label
+    # among its neighbours. Deterministic here because the visit order is a fixed
+    # permutation seeded off the node count rather than reshuffled per pass.
+    labels = list(range(n))
+    order = sorted(range(n), key=lambda i: (len(adjacency[i]), i))
+    for _ in range(12):  # converges well before this on graphs of this size
+        changed = 0
+        for i in order:
+            if not adjacency[i]:
+                continue
+            tally = {}
+            for j, w in adjacency[i]:
+                tally[labels[j]] = tally.get(labels[j], 0.0) + w
+            # Highest weighted vote; lowest label id breaks ties for determinism.
+            best = min(tally.items(), key=lambda kv: (-kv[1], kv[0]))[0]
+            if labels[i] != best:
+                labels[i] = best
+                changed += 1
+        if not changed:
+            break
+
+    # Compact the surviving labels to 0..m-1 so the colour scale stays small.
+    remap = {}
+    for i, lab in enumerate(labels):
+        if lab not in remap:
+            remap[lab] = len(remap)
+        labels[i] = remap[lab]
+    n_components = len(remap)
+    print(f"  {len(edges)} edges, {n_components} communities "
+          f"(avg degree {2 * len(edges) / max(1, n):.1f})")
 
     # Build paper lookup for title/year
     paper_lookup = {}
@@ -682,12 +751,20 @@ def build_embedding_graph(threshold=0.65):
         "nodes": nodes,
         "edges": edges,
         "meta": {
-            "type": "embedding_similarity",
-            "threshold": threshold,
+            "type": "embedding_knn",
+            "top_k": k,
+            "threshold": floor,
             "embedding_provider": EMBEDDING_PROVIDER,
             "total_papers": len(paper_ids),
             "total_edges": len(edges),
-            "communities": int(n_components)
+            "avg_degree": round(2 * len(edges) / max(1, len(paper_ids)), 2),
+            "communities": int(n_components),
+            # Recorded so a cache built from a different corpus or a different
+            # embedding set is detected instead of being served forever as current.
+            # The on-disk cache said total_papers=1501 against a 1681-paper corpus.
+            "corpus_papers": len(papers_global) if papers_global else 0,
+            "embeddings_mtime": (EMBEDDING_CACHE.stat().st_mtime
+                                 if EMBEDDING_CACHE.exists() else 0),
         }
     }
 
@@ -697,13 +774,34 @@ def build_embedding_graph(threshold=0.65):
     return graph
 
 
-def load_or_build_embedding_graph(threshold=0.65):
+def _graph_cache_is_current(graph):
+    """Reject a cache built from a different corpus, provider or edge rule.
+
+    Caches used to be trusted on existence alone, so the on-disk graph (1501
+    papers, threshold 0.7, no communities) was served indefinitely against a
+    1681-paper corpus -- ~180 papers silently missing from what the user was shown.
+    """
+    meta = (graph or {}).get("meta") or {}
+    if meta.get("type") != "embedding_knn":
+        return False  # built by the old threshold rule
+    if meta.get("embedding_provider") != EMBEDDING_PROVIDER:
+        return False
+    if meta.get("corpus_papers") != (len(papers_global) if papers_global else 0):
+        return False
+    on_disk = EMBEDDING_CACHE.stat().st_mtime if EMBEDDING_CACHE.exists() else 0
+    return abs(float(meta.get("embeddings_mtime") or 0) - on_disk) < 1.0
+
+
+def load_or_build_embedding_graph(threshold=None, top_k=None):
     if EMBEDDING_GRAPH_CACHE.exists():
         try:
-            return json.load(open(EMBEDDING_GRAPH_CACHE))
+            cached = json.load(open(EMBEDDING_GRAPH_CACHE, encoding="utf-8"))
+            if _graph_cache_is_current(cached):
+                return cached
+            print("  Embedding graph cache is stale; rebuilding.")
         except Exception:
             pass
-    return build_embedding_graph(threshold=threshold)
+    return build_embedding_graph(threshold=threshold, top_k=top_k)
 
 
 def load_or_build_merged_graph():
@@ -1912,10 +2010,14 @@ class Handler(SimpleHTTPRequestHandler):
                     logger.info("  embedding_graph handler ENTERED")
                     merged = params.get("merged", ["0"])[0] == "1"
                     rebuild = params.get("rebuild", ["0"])[0] == "1"
-                    threshold = float(params.get("threshold", ["0.7"])[0])
-                    logger.info(f"  merged={merged}, rebuild={rebuild}, threshold={threshold}")
+                    # Edge count is governed by top_k now, not a cosine cutoff.
+                    try:
+                        top_k = int(params.get("top_k", [str(GRAPH_TOP_K)])[0])
+                    except (TypeError, ValueError):
+                        top_k = GRAPH_TOP_K
+                    logger.info(f"  merged={merged}, rebuild={rebuild}, top_k={top_k}")
                     if rebuild:
-                        graph = build_embedding_graph(threshold=threshold)
+                        graph = build_embedding_graph(top_k=top_k)
                         if MERGED_GRAPH_CACHE.exists():
                             MERGED_GRAPH_CACHE.unlink()
                         if graph is None:
@@ -2433,7 +2535,11 @@ class Handler(SimpleHTTPRequestHandler):
             elif path == "/api/embedding_graph":
                 rebuild = data.get("rebuild", False)
                 if rebuild:
-                    graph = build_embedding_graph(threshold=float(data.get("threshold", 0.7)))
+                    try:
+                        _tk = int(data.get("top_k", GRAPH_TOP_K))
+                    except (TypeError, ValueError):
+                        _tk = GRAPH_TOP_K
+                    graph = build_embedding_graph(top_k=_tk)
                     if graph is None:
                         self._json({"error": "Not enough embeddings to build graph."})
                         return

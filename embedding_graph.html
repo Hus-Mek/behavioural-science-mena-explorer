@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Embedding Graph</title>
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;}
+body{background:#121218;color:#c8c8d0;font-family:system-ui,sans-serif;overflow:hidden;}
+svg{width:100%;height:100vh;display:block;}
+.controls{position:fixed;top:12px;left:12px;z-index:10;display:flex;gap:8px;align-items:center;
+  background:rgba(18,18,24,0.85);padding:8px 14px;border-radius:10px;border:1px solid rgba(255,255,255,0.08);
+  backdrop-filter:blur(8px);font-size:12px;}
+.controls label{color:#888;display:flex;align-items:center;gap:6px;cursor:pointer;}
+.controls input[type="checkbox"]{accent-color:#8b5cf6;width:14px;height:14px;cursor:pointer;}
+.controls select{background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);color:#c8c8d0;
+  padding:4px 8px;border-radius:6px;font-size:11.5px;cursor:pointer;outline:none;}
+.controls select option{background:#1e1e2a;color:#c8c8d0;}
+.legend{position:fixed;bottom:16px;left:16px;z-index:10;display:flex;gap:14px;
+  background:rgba(18,18,24,0.85);padding:8px 14px;border-radius:10px;border:1px solid rgba(255,255,255,0.08);
+  font-size:11px;flex-wrap:wrap;}
+.legend-item{display:flex;align-items:center;gap:6px;color:#999;}
+.legend-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0;}
+.stats{position:fixed;bottom:16px;right:16px;z-index:10;
+  background:rgba(18,18,24,0.85);padding:8px 14px;border-radius:10px;border:1px solid rgba(255,255,255,0.08);
+  font-size:11px;color:#666;text-align:right;line-height:1.6;}
+.tooltip{position:fixed;z-index:100;background:rgba(24,24,34,0.95);border:1px solid rgba(255,255,255,0.12);
+  border-radius:8px;padding:10px 14px;font-size:12px;max-width:340px;pointer-events:none;
+  line-height:1.5;backdrop-filter:blur(8px);box-shadow:0 8px 30px rgba(0,0,0,0.6);}
+.tooltip .tt-title{font-weight:600;color:#e8e8f0;margin-bottom:4px;}
+.tooltip .tt-meta{color:#888;font-size:10.5px;}
+.charge-slider{width:100px;}
+</style>
+</head>
+<body>
+<div class="controls">
+  <label><input type="checkbox" id="showSemantic" checked onchange="updateDisplay()"> Semantic</label>
+  <label><input type="checkbox" id="showKeyword" checked onchange="updateDisplay()"> Keyword</label>
+  <label>
+    Charge
+    <input type="range" class="charge-slider" id="chargeSlider" min="-1000" max="-50" value="-200" oninput="updateCharge(this.value)">
+  </label>
+  <select id="nodeSizing" onchange="updateDisplay()">
+    <option value="fixed">Fixed size</option>
+    <option value="degree">By degree</option>
+  </select>
+</div>
+<div class="legend" id="legend"></div>
+<div class="stats" id="stats"></div>
+<!-- initGraph() does d3.select('svg'), which needs this element to already exist.
+     It was missing, and d3 silently no-ops on an empty selection, so every append
+     did nothing: the stats and legend populated (plain innerHTML) while the graph
+     itself never drew a single element. -->
+<svg id="graph"></svg>
+<div class="tooltip" id="tooltip" style="display:none;"></div>
+
+<script>
+const params = new URLSearchParams(window.location.search);
+const merged = params.get('merged') === '1';
+const endpoint = merged ? '/api/embedding_graph?merged=1' : '/api/embedding_graph';
+
+let graphData = null;
+let svg, simulation, gLink, gNode;
+let nodes, links;
+
+const EDGE_COLORS = {
+  semantic: '#6366f1',
+  keyword: '#f59e0b',
+  both: '#22c55e'
+};
+
+const EDGE_LABELS = {
+  semantic: 'Semantic similarity',
+  keyword: 'Keyword co-occurrence',
+  both: 'Both'
+};
+
+// Module scope, not inside initGraph(): render() colours nodes by community with
+// this scale, and a function-local const left render() throwing
+// "color is not defined" the moment it tried to draw.
+const color = d3.scaleOrdinal(d3.schemeTableau10);
+
+async function loadGraph(){
+  try {
+    const resp = await fetch(endpoint);
+    const data = await resp.json();
+    if(data.error){
+      document.body.innerHTML = '<div style="padding:40px;text-align:center;color:#888;">'+data.error+'</div>';
+      return;
+    }
+    graphData = data;
+    initGraph();
+    updateStats();
+  } catch(e){
+    document.body.innerHTML = '<div style="padding:40px;text-align:center;color:#f44;">Error loading graph: '+e.message+'</div>';
+  }
+}
+
+function updateStats(){
+  const data = graphData;
+  const total = data.edges ? data.edges.length : 0;
+  const sem = data.edges ? data.edges.filter(e => e.type === 'semantic' || e.type === 'both').length : 0;
+  const kw = data.edges ? data.edges.filter(e => e.type === 'keyword' || e.type === 'both').length : 0;
+  const both = data.edges ? data.edges.filter(e => e.type === 'both').length : 0;
+  const nn = data.nodes ? data.nodes.length : 0;
+  document.getElementById('stats').innerHTML = nn+' nodes<br>'+total+' edges<br>';
+  document.getElementById('legend').innerHTML =
+    '<div class="legend-item"><span class="legend-dot" style="background:'+EDGE_COLORS.semantic+';opacity:.7"></span>Semantic: '+sem+'</div>'+
+    '<div class="legend-item"><span class="legend-dot" style="background:'+EDGE_COLORS.keyword+';opacity:.7"></span>Keyword: '+kw+'</div>'+
+    (both > 0 ? '<div class="legend-item"><span class="legend-dot" style="background:'+EDGE_COLORS.both+';opacity:.7"></span>Both: '+both+'</div>' : '');
+}
+
+function initGraph(){
+  nodes = graphData.nodes.map(n => ({...n}));
+  links = graphData.edges.map(e => ({...e}));
+
+  svg = d3.select('svg');
+  svg.selectAll('*').remove();
+
+  const width = window.innerWidth;
+  const height = window.innerHeight;
+
+  simulation = d3.forceSimulation(nodes)
+    .force('link', d3.forceLink(links).id(d => d.id).distance(d => d.type === 'semantic' ? 40 : 60))
+    .force('charge', d3.forceManyBody().strength(-200))
+    .force('center', d3.forceCenter(width / 2, height / 2))
+    .force('collision', d3.forceCollide().radius(12));
+
+  gLink = svg.append('g');
+  gNode = svg.append('g');
+
+  render();
+
+  simulation.on('tick', () => {
+    gLink.selectAll('line')
+      .attr('x1', d => d.source.x)
+      .attr('y1', d => d.source.y)
+      .attr('x2', d => d.target.x)
+      .attr('y2', d => d.target.y);
+    gNode.selectAll('g')
+      .attr('transform', d => `translate(${d.x},${d.y})`);
+  });
+
+  const zoom = d3.zoom()
+    .scaleExtent([0.1, 10])
+    .on('zoom', (event) => {
+      svg.selectAll('g').attr('transform', event.transform);
+    });
+  svg.call(zoom);
+}
+
+function render(){
+  const semOn = document.getElementById('showSemantic').checked;
+  const kwOn = document.getElementById('showKeyword').checked;
+  const sizing = document.getElementById('nodeSizing').value;
+
+  const visibleLinks = links.filter(l => {
+    if(l.type === 'semantic' && semOn) return true;
+    if(l.type === 'keyword' && kwOn) return true;
+    if(l.type === 'both' && (semOn || kwOn)) return true;
+    return false;
+  });
+
+  const link = gLink.selectAll('line').data(visibleLinks, d => d.source.id + '-' + d.target.id);
+  link.exit().remove();
+  const linkEnter = link.enter().append('line');
+  gLink.selectAll('line')
+    .attr('stroke', d => {
+      if(d.type === 'both') return EDGE_COLORS.both;
+      return EDGE_COLORS[d.type] || '#555';
+    })
+    .attr('stroke-opacity', d => d.type === 'both' ? 0.8 : 0.35)
+    .attr('stroke-width', d => {
+      if(d.type === 'both') return 2;
+      return Math.max(0.5, Math.min(3, (d.weight || 1) * 2));
+    });
+
+  const nodeGroups = gNode.selectAll('g').data(nodes, d => d.id);
+  nodeGroups.exit().remove();
+  const nodeEnter = nodeGroups.enter().append('g')
+    .call(d3.drag()
+      .on('start', (event, d) => {
+        if(!event.active) simulation.alphaTarget(0.3).restart();
+        d.fx = d.x;
+        d.fy = d.y;
+      })
+      .on('drag', (event, d) => {
+        d.fx = event.x;
+        d.fy = event.y;
+      })
+      .on('end', (event, d) => {
+        if(!event.active) simulation.alphaTarget(0);
+        d.fx = null;
+        d.fy = null;
+      }));
+
+  nodeEnter.append('circle')
+    .attr('r', d => {
+      if(sizing === 'degree'){
+        const degree = links.filter(l => l.source.id === d.id || l.target.id === d.id).length;
+        return Math.max(3, Math.min(12, Math.sqrt(degree) * 2));
+      }
+      return 5;
+    })
+    .attr('fill', d => color(d.community != null ? d.community : 0))
+    .attr('stroke', 'rgba(255,255,255,0.15)')
+    .attr('stroke-width', 1);
+
+  nodeEnter.append('title').text(d => d.label || d.id);
+
+  nodeEnter.on('mouseenter', (event, d) => {
+    const tt = document.getElementById('tooltip');
+    const degree = links.filter(l => l.source.id === d.id || l.target.id === d.id).length;
+    tt.innerHTML = '<div class="tt-title">'+(d.label || d.id)+'</div>' +
+      '<div class="tt-meta">Degree: '+degree+'</div>' +
+      (d.year ? '<div class="tt-meta">Year: '+d.year+'</div>' : '');
+    tt.style.display = 'block';
+    tt.style.left = (event.clientX + 14) + 'px';
+    tt.style.top = (event.clientY - 10) + 'px';
+  }).on('mousemove', (event) => {
+    const tt = document.getElementById('tooltip');
+    tt.style.left = (event.clientX + 14) + 'px';
+    tt.style.top = (event.clientY - 10) + 'px';
+  }).on('mouseleave', () => {
+    document.getElementById('tooltip').style.display = 'none';
+  });
+
+  simulation.nodes(nodes);
+  simulation.force('link').links(visibleLinks);
+  simulation.alpha(0.3).restart();
+}
+
+function updateDisplay(){
+  render();
+  updateStats();
+}
+
+function updateCharge(val){
+  simulation.force('charge').strength(+val);
+  simulation.alpha(0.3).restart();
+}
+
+window.addEventListener('resize', () => {
+  simulation.force('center', d3.forceCenter(window.innerWidth / 2, window.innerHeight / 2));
+  simulation.alpha(0.3).restart();
+});
+
+loadGraph();
+</script>
+</body>
+</html>
