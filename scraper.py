@@ -16,6 +16,7 @@ import argparse
 import shutil
 import random
 import urllib.parse
+from datetime import date, timedelta
 from pathlib import Path
 from collections import Counter
 
@@ -120,6 +121,59 @@ class PoliteSession:
         time.sleep(wait)
         self._pace(host)
         return self._session.get(url, **kwargs)
+
+# ── Query translation ──────────────────────────────────────────────────────
+# The query banks below are written in arXiv's field syntax ('all:"COM-B" OR
+# all:"Michie"'), and server.py wraps every scrape as
+#   "(behaviour OR behavior OR ... 25 generic terms ...) AND (<the real topic>)".
+# Both forms were sent verbatim to all twelve sources. 'all:' is not a field tag
+# anywhere but arXiv, and on a free-text relevance endpoint (CrossRef, Semantic
+# Scholar, OpenAlex, OSF, the grey sources) those 25 generic terms swamp the
+# topic entirely. Each source now gets a form it can actually parse.
+
+_FIELD_PREFIX = re.compile(r'\b(?:all|ti|abs|au|cat|co|jr|rn)\s*:', re.I)
+_BOOLEAN_WORD = re.compile(r'\b(?:ANDNOT|AND|OR|NOT)\b')
+_QUOTED_PHRASE = re.compile(r'"([^"]*)"')
+
+# Endpoints that understand parenthesised boolean queries.
+BOOLEAN_SOURCES = {'pubmed', 'pubmedcentral'}
+# Free-text relevance endpoints degrade badly with long OR-chains.
+MAX_FREETEXT_TERMS = 8
+
+
+def _topic_group(query):
+    """Return the topic half of "(<generic filter>) AND (<topic>)"."""
+    groups = re.findall(r'\(([^()]*)\)', query)
+    return groups[-1] if len(groups) >= 2 else query
+
+
+def to_plain_terms(query, limit=MAX_FREETEXT_TERMS):
+    """Reduce an arXiv/boolean query to a short list of plain search terms."""
+    q = _FIELD_PREFIX.sub(' ', _topic_group(query))
+    phrases = [p.strip() for p in _QUOTED_PHRASE.findall(q) if p.strip()]
+    remainder = _BOOLEAN_WORD.sub(' ', _QUOTED_PHRASE.sub(' ', q))
+    words = [w for w in re.split(r'[^\w\-]+', remainder) if len(w) > 1]
+    terms, seen = [], set()
+    for term in phrases + words:
+        key = term.lower()
+        if key not in seen:
+            seen.add(key)
+            terms.append(term)
+    return terms[:limit]
+
+
+def translate_query(query, src):
+    """Rewrite `query` into the syntax `src` actually supports."""
+    if src == 'arxiv':
+        return query
+    if src in BOOLEAN_SOURCES:
+        # PubMed handles parenthesised boolean fine; it only chokes on 'all:'.
+        return _FIELD_PREFIX.sub('', query).strip()
+    terms = to_plain_terms(query)
+    if not terms:
+        return _FIELD_PREFIX.sub('', query).strip()
+    return ' '.join(f'"{t}"' if ' ' in t else t for t in terms)
+
 
 try:
     from grey_sources import libgen_search, annas_archive_search
@@ -390,7 +444,10 @@ class MultiSourceScraper:
                 print(f"  {src}: unknown source, skipped")
                 self.source_results[src] = "skipped"
                 continue
-            q = arxiv_query if src == 'arxiv' and arxiv_query else query
+            if src == 'arxiv' and arxiv_query:
+                q = arxiv_query
+            else:
+                q = translate_query(query, src)
             try:
                 got = getattr(self, method_name)(q, max_results) or []
             except Exception as e:
@@ -400,7 +457,9 @@ class MultiSourceScraper:
                 continue
             self.source_results[src] = len(got)
             self.sources_ok.add(src)
-            print(f"  {src}: {len(got)} results")
+            # Effective query is echoed so a bad translation is visible rather than
+            # showing up only as a suspiciously low result count.
+            print(f"  {src}: {len(got)} results  [q: {q[:60]}]")
             papers.extend(got)
         return papers
 
@@ -769,41 +828,99 @@ class MultiSourceScraper:
 
     # ── bioRxiv ─────────────────────────────────────────────────────────────
     def search_biorxiv(self, query, max_results=100):
+        """Fetch recent bioRxiv preprints by date range and filter them locally.
+
+        This source had never returned a single paper. It requested
+        /details/biorxiv/0/9999, and bioRxiv answers a malformed interval with
+        HTTP *200* carrying {"messages":[{"status":"Both dates must be in
+        yyyy-mm-dd format"}]} and an empty collection -- so the status check
+        passed, the loop had nothing to iterate, and the source reported zero
+        forever with no error anywhere. The 'q' and 'num_results' params were
+        never real either: this endpoint has no keyword search.
+
+        So: page a real date window, then filter locally on the query terms,
+        because the API genuinely cannot search. Zero is an honest answer when
+        the window holds nothing on topic.
+        """
         papers = []
+        terms = [t.lower() for t in to_plain_terms(query)]
         pbar = self._pbar(min(max_results, 100), f"bioRxiv:{query[:20]}")
+        window_days, max_pages = 180, 4
+        end, start = date.today(), date.today() - timedelta(days=window_days)
+        base = (f"https://api.biorxiv.org/details/biorxiv/"
+                f"{start.isoformat()}/{end.isoformat()}")
+        scanned = 0
         try:
-            r = self.session.get(
-                "https://api.biorxiv.org/details/biorxiv/0/9999",
-                params={'q': query, 'num_results': min(max_results, 100)},
-                timeout=30
-            )
-            if r.status_code != 200:
-                print(f"  bioRxiv HTTP {r.status_code}")
-                pbar.close()
-                return []
-            try:
-                data = r.json()
-            except json.JSONDecodeError as e:
-                print(f"  bioRxiv JSON parse error: {e}")
-                pbar.close()
-                return []
-            for item in (data.get('collection') or [])[:max_results]:
-                papers.append({
-                    'id': f"bioRxiv:{item.get('doi', '')}",
-                    'title': item.get('title') or '',
-                    'authors': [a.strip() for a in (item.get('authors') or '').split(';') if a.strip()],
-                    'summary': item.get('abstract') or '',
-                    'published': item.get('date', ''),
-                    'pdf_url': f"https://www.biorxiv.org/content/{item.get('doi', '')}.full.pdf" if item.get('doi') else '',
-                    'pdf_source': 'biorxiv',
-                    'source': 'bioRxiv',
-                    'doi': item.get('doi', ''),
-                })
-                pbar.update(1)
+            for page in range(max_pages):
+                if len(papers) >= max_results:
+                    break
+                r = self.session.get(f"{base}/{page * 30}", timeout=30)
+                if r.status_code != 200:
+                    print(f"  bioRxiv HTTP {r.status_code}")
+                    break
+                try:
+                    data = r.json()
+                except json.JSONDecodeError as e:
+                    print(f"  bioRxiv JSON parse error: {e}")
+                    break
+                # bioRxiv reports interval/format errors inside a 200 body.
+                messages = data.get('messages') or []
+                status = (messages[0].get('status') if messages else 'ok')
+                if status != 'ok':
+                    print(f"  bioRxiv API error: {status}")
+                    break
+                batch = data.get('collection') or []
+                if not batch:
+                    break
+                for item in batch:
+                    if len(papers) >= max_results:
+                        break
+                    scanned += 1
+                    title = item.get('title') or ''
+                    abstract = item.get('abstract') or ''
+                    if terms and not self._matches_terms(title, abstract, terms):
+                        continue
+                    papers.append(self._biorxiv_record(item, title, abstract))
+                    pbar.update(1)
         except (Timeout, ConnectionError, RequestException) as e:
             print(f"  bioRxiv request error: {e}")
+        if terms:
+            print(f"  bioRxiv: scanned {scanned} preprints from the last "
+                  f"{window_days} days, kept {len(papers)} (no server-side search)")
         pbar.close()
         return papers
+
+    @staticmethod
+    def _matches_terms(title, abstract, terms):
+        """Local relevance test for sources that cannot search server-side.
+
+        Matching on ANY single term is far too loose: a query for "single cell RNA
+        sequencing" kept an annelid-eye-evolution preprint because "cell" appeared
+        once in its abstract. So a multi-word phrase hit counts on its own, but
+        bare words must corroborate -- at least two distinct ones.
+        """
+        haystack = f"{title} {abstract}".lower()
+        phrases = [t for t in terms if ' ' in t]
+        if any(p in haystack for p in phrases):
+            return True
+        words = [t for t in terms if ' ' not in t and len(t) > 2]
+        hits = sum(1 for w in words if w in haystack)
+        return hits >= min(2, len(words)) if words else False
+
+    @staticmethod
+    def _biorxiv_record(item, title, abstract):
+        doi = item.get('doi') or ''
+        return {
+            'id': f"bioRxiv:{doi}",
+            'title': title,
+            'authors': [a.strip() for a in (item.get('authors') or '').split(';') if a.strip()],
+            'summary': abstract,
+            'published': item.get('date', ''),
+            'pdf_url': f"https://www.biorxiv.org/content/{doi}.full.pdf" if doi else '',
+            'pdf_source': 'biorxiv',
+            'source': 'bioRxiv',
+            'doi': doi,
+        }
 
     # ── PsyArXiv ────────────────────────────────────────────────────────────
     def search_psyarxiv(self, query, max_results=100):
@@ -1102,7 +1219,11 @@ if __name__ == "__main__":
                         help='Custom query string. For arXiv, this is wrapped as all:"custom query".')
     parser.add_argument('--tag', default=None, help='Output tag; defaults to query/group/custom')
     parser.add_argument('--delay', type=float, default=3, help='Delay between arXiv requests')
-    parser.add_argument('-n', '--num', type=int, default=50, help='Max results per query')
+    # Per source per query, not per query: with the default 12 sources, -n 50 can
+    # return up to 600 papers before dedup. The GUI already labels this "Max each";
+    # only this help text was wrong, so the text is what changed.
+    parser.add_argument('-n', '--num', type=int, default=50,
+                        help='Max results per source per query (12 sources by default)')
     parser.add_argument('--sources', default='arxiv,pubmed,pubmedcentral,semanticscholar,crossref,openalex,biorxiv,psyarxiv,osf,researchgate,libgen,annas',
                         help='Comma-separated sources (includes grey: libgen, annas)')
     parser.add_argument('--all-models', action='store_true', help='Run ALL behavioural model queries')
