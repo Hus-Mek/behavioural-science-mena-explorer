@@ -328,22 +328,40 @@ EMBEDDING_CACHE = ROOT / "data" / "embeddings.json"
 EMBEDDING_META_CACHE = ROOT / "data" / "embeddings_meta.json"
 _paper_embeddings = None
 _paper_embedding_ids = []
+# Guards replacement of the (matrix, ids) pair. They are two separate globals that
+# must agree by position: row i of the matrix belongs to ids[i]. Readers that
+# touched them in separate statements could pair a NEW matrix with OLD ids, which
+# silently maps similarity scores onto the wrong papers -- a wrong-answer bug, not
+# a crash. Writers hold this lock; readers take a coherent pair via
+# embedding_snapshot().
+_embedding_lock = threading.Lock()
+
+
+def embedding_snapshot():
+    """Return (matrix, ids) as a pair that agree with each other."""
+    with _embedding_lock:
+        return _paper_embeddings, _paper_embedding_ids
+
+
+def _set_embeddings(matrix, ids):
+    global _paper_embeddings, _paper_embedding_ids
+    with _embedding_lock:
+        _paper_embeddings = matrix
+        _paper_embedding_ids = ids
+
 
 def _load_embeddings():
-    global _paper_embeddings, _paper_embedding_ids
     import numpy as np
     if _paper_embeddings is not None:
         return
     if EMBEDDING_CACHE.exists():
         try:
             cached = json.load(open(EMBEDDING_CACHE))
-            _paper_embeddings = np.array(cached["embeddings"])
-            _paper_embedding_ids = cached["ids"]
+            _set_embeddings(np.array(cached["embeddings"]), cached["ids"])
             return
         except Exception:
             pass
-    _paper_embeddings = None
-    _paper_embedding_ids = []
+    _set_embeddings(None, [])
 
 def _get_embedding_openai(text):
     api_key = get_api_key()
@@ -406,7 +424,7 @@ def _get_embedding(text):
     return _get_embedding_openai(text)
 
 def build_embeddings(papers, provider=None, batch=True):
-    global _paper_embeddings, _paper_embedding_ids
+    # No `global` here: the pair is replaced only via _set_embeddings(), under the lock.
     import numpy as np
 
     if provider is None:
@@ -424,7 +442,8 @@ def build_embeddings(papers, provider=None, batch=True):
     paper_ids = [p.get("id") or p.get("entry_id") for p in papers]
 
     # Check cache: if same IDs and same provider, skip
-    if _paper_embedding_ids == paper_ids and _paper_embeddings is not None:
+    cached_matrix, cached_ids = embedding_snapshot()
+    if cached_ids == paper_ids and cached_matrix is not None:
         meta = {}
         if EMBEDDING_META_CACHE.exists():
             try:
@@ -506,13 +525,17 @@ def build_embeddings(papers, provider=None, batch=True):
                 print(f"    {i+1}/{len(papers)} embedded")
 
     if embeddings:
-        _paper_embeddings = np.array(embeddings)
-        _paper_embedding_ids = ids
-        try:
-            json.dump({"embeddings": _paper_embeddings.tolist(), "ids": ids}, open(EMBEDDING_CACHE, "w"))
-            json.dump({"provider": provider, "model": EMBEDDING_MODEL_GEMINI if provider == "gemini" else EMBEDDING_MODEL_OPENAI, "count": len(ids)}, open(EMBEDDING_META_CACHE, "w"))
-        except Exception:
-            pass
+        _set_embeddings(np.array(embeddings), ids)
+        # Was json.dump(..., open(path, "w")) -- the handle was never closed, so a
+        # 71MB write had no guaranteed flush, and it truncated in place while other
+        # threads could be reading it.
+        atomic_write_json(EMBEDDING_CACHE,
+                          {"embeddings": np.array(embeddings).tolist(), "ids": ids})
+        atomic_write_json(EMBEDDING_META_CACHE, {
+            "provider": provider,
+            "model": EMBEDDING_MODEL_GEMINI if provider == "gemini" else EMBEDDING_MODEL_OPENAI,
+            "count": len(ids),
+        })
         print(f"  Embeddings built: {len(ids)} papers (provider={provider})")
     else:
         print("  No embeddings were generated.")
@@ -520,21 +543,22 @@ def build_embeddings(papers, provider=None, batch=True):
 def semantic_search(query, papers, top_k=15):
     import numpy as np
     _load_embeddings()
-    if _paper_embeddings is None or len(_paper_embeddings) == 0:
+    emb_matrix, emb_ids = embedding_snapshot()
+    if emb_matrix is None or len(emb_matrix) == 0:
         return []
     query_emb = _get_embedding(query)
     if query_emb is None:
         return []
     query_vec = np.array(query_emb)
-    norms = np.linalg.norm(_paper_embeddings, axis=1)
+    norms = np.linalg.norm(emb_matrix, axis=1)
     query_norm = np.linalg.norm(query_vec)
     if query_norm == 0:
         return []
-    similarities = np.dot(_paper_embeddings, query_vec) / (norms * query_norm)
+    similarities = np.dot(emb_matrix, query_vec) / (norms * query_norm)
     top_indices = np.argsort(similarities)[::-1][:top_k]
     results = []
     for idx in top_indices:
-        paper_id = _paper_embedding_ids[idx]
+        paper_id = emb_ids[idx]
         paper = next((p for p in papers if (p.get("id") or p.get("entry_id")) == paper_id), None)
         if paper:
             results.append({"paper": paper, "score": float(similarities[idx])})
@@ -542,21 +566,22 @@ def semantic_search(query, papers, top_k=15):
 
 def score_papers_by_embedding(papers, query, top_k=None):
     _load_embeddings()
-    if _paper_embeddings is None or len(_paper_embeddings) == 0:
+    emb_matrix, emb_ids = embedding_snapshot()
+    if emb_matrix is None or len(emb_matrix) == 0:
         return []
     query_emb = _get_embedding(query)
     if query_emb is None:
         return []
     import numpy as np
     query_vec = np.array(query_emb)
-    norms = np.linalg.norm(_paper_embeddings, axis=1)
+    norms = np.linalg.norm(emb_matrix, axis=1)
     query_norm = np.linalg.norm(query_vec)
     if query_norm == 0:
         return []
-    similarities = np.dot(_paper_embeddings, query_vec) / (norms * query_norm)
+    similarities = np.dot(emb_matrix, query_vec) / (norms * query_norm)
     scored = []
     for i, sim in enumerate(similarities):
-        pid = _paper_embedding_ids[i]
+        pid = emb_ids[i]
         paper = next((p for p in papers if (p.get("id") or p.get("entry_id")) == pid), None)
         if paper:
             scored.append((paper, float(sim)))
@@ -582,13 +607,12 @@ MERGED_GRAPH_CACHE = ROOT / "data" / "merged_graph.json"
 def build_embedding_graph(threshold=0.65):
     import numpy as np
     _load_embeddings()
-    if _paper_embeddings is None or len(_paper_embeddings) < 2:
+    embs, paper_ids = embedding_snapshot()
+    if embs is None or len(embs) < 2:
         print("  Not enough embeddings to build graph.")
         return None
 
-    paper_ids = _paper_embedding_ids
     print(f"  Computing embedding similarity matrix ({len(paper_ids)} papers)...")
-    embs = _paper_embeddings
     norms = np.linalg.norm(embs, axis=1, keepdims=True)
     sim_matrix = np.dot(embs, embs.T) / (norms * norms.T)
     np.fill_diagonal(sim_matrix, 0)
@@ -661,12 +685,8 @@ def build_embedding_graph(threshold=0.65):
         }
     }
 
-    try:
-        with open(EMBEDDING_GRAPH_CACHE, "w") as f:
-            json.dump(graph, f)
+    if atomic_write_json(EMBEDDING_GRAPH_CACHE, graph):
         print(f"  Embedding graph saved: {len(nodes)} nodes, {len(edges)} edges, {n_components} communities")
-    except Exception as e:
-        print(f"  Warning: could not save embedding graph: {e}")
 
     return graph
 
@@ -688,11 +708,7 @@ def load_or_build_merged_graph():
             pass
     merged = merge_graphs()
     if merged and "error" not in merged:
-        try:
-            with open(MERGED_GRAPH_CACHE, "w") as f:
-                json.dump(merged, f)
-        except Exception:
-            pass
+        atomic_write_json(MERGED_GRAPH_CACHE, merged)
     return merged
 
 
@@ -781,15 +797,16 @@ def hybrid_search(query, papers, top_k=30):
 
     _load_embeddings()
     semantic_scores = {}
-    if _paper_embeddings is not None and len(_paper_embeddings) > 0:
+    emb_matrix, emb_ids = embedding_snapshot()
+    if emb_matrix is not None and len(emb_matrix) > 0:
         query_emb = _get_embedding(query)
         if query_emb is not None:
             query_vec = np.array(query_emb)
-            norms = np.linalg.norm(_paper_embeddings, axis=1)
+            norms = np.linalg.norm(emb_matrix, axis=1)
             query_norm = np.linalg.norm(query_vec)
             if query_norm > 0:
-                similarities = np.dot(_paper_embeddings, query_vec) / (norms * query_norm)
-                for idx, pid in enumerate(_paper_embedding_ids):
+                similarities = np.dot(emb_matrix, query_vec) / (norms * query_norm)
+                for idx, pid in enumerate(emb_ids):
                     sim = float(similarities[idx])
                     if sim > 0:
                         semantic_scores[pid] = sim
@@ -937,12 +954,38 @@ ANALYSIS_CACHE = ROOT / "data" / "analysis_cache.json"
 ANALYSIS_DIR = ROOT / "data" / "analyses"
 ANALYSIS_DIR.mkdir(parents=True, exist_ok=True)
 
-def save_analysis(analysis):
+def atomic_write_json(path, obj, **dump_kwargs):
+    """Write JSON via a temp file in the same directory, then os.replace.
+
+    Every cache here was written in place with mode "w", which truncates first.
+    Readers are on other threads (ThreadingHTTPServer) and readers of a
+    half-written file get a JSONDecodeError that the surrounding `except:
+    pass` turns into "no cache" -- so a concurrent read during a save silently
+    discarded the analysis or, worse, the embeddings. The window is long: the
+    analysis cache is ~1.2MB and embeddings.json ~71MB. os.replace is atomic, so
+    a reader sees either the whole old file or the whole new one, and a crash
+    mid-write leaves the previous file intact.
+    """
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
     try:
-        with open(ANALYSIS_CACHE, "w", encoding="utf-8") as f:
-            json.dump(analysis, f, ensure_ascii=False)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f, **dump_kwargs)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        return True
     except Exception as e:
-        print(f"Warning: could not save analysis cache: {e}")
+        print(f"Warning: could not write {path.name}: {e}")
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return False
+
+
+def save_analysis(analysis):
+    atomic_write_json(ANALYSIS_CACHE, analysis, ensure_ascii=False)
 
 def load_analysis():
     if ANALYSIS_CACHE.exists():
@@ -954,12 +997,8 @@ def load_analysis():
 
 def save_paper_analysis(paper_id, analysis):
     safe_id = re.sub(r'[^a-zA-Z0-9._-]', '_', str(paper_id))
-    path = ANALYSIS_DIR / f"{safe_id}.json"
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(analysis, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"Warning: could not save analysis for {paper_id}: {e}")
+    atomic_write_json(ANALYSIS_DIR / f"{safe_id}.json", analysis,
+                      ensure_ascii=False, indent=2)
 
 def load_paper_analysis(paper_id):
     safe_id = re.sub(r'[^a-zA-Z0-9._-]', '_', str(paper_id))
@@ -1055,16 +1094,18 @@ def load_papers():
         print(f"  Title dedup removed {removed} near-duplicate papers")
 
     _load_embeddings()
-    if _paper_embeddings is not None and len(_paper_embedding_ids) > 0:
+    emb_matrix, emb_ids = embedding_snapshot()
+    if emb_matrix is not None and len(emb_ids) > 0:
         import numpy as np
         deduped_ids = [(p.get("id") or p.get("entry_id")) for p in deduped]
         deduped_to_emb = {}
+        emb_pos = {pid: i for i, pid in enumerate(emb_ids)}  # was .index() per paper: O(n^2)
         for di, pid in enumerate(deduped_ids):
-            if pid in _paper_embedding_ids:
-                deduped_to_emb[di] = _paper_embedding_ids.index(pid)
+            if pid in emb_pos:
+                deduped_to_emb[di] = emb_pos[pid]
         if len(deduped_to_emb) > 1:
             indices = list(deduped_to_emb.values())
-            emb_vectors = _paper_embeddings[indices]
+            emb_vectors = emb_matrix[indices]
             norms = np.linalg.norm(emb_vectors, axis=1, keepdims=True)
             sim_matrix = np.dot(emb_vectors, emb_vectors.T) / (norms * norms.T)
             deduped_indices = list(deduped_to_emb.keys())
@@ -1152,16 +1193,18 @@ def load_latest_scrape():
         print(f"  Title dedup removed {removed} near-duplicate papers from latest scrape")
 
     _load_embeddings()
-    if _paper_embeddings is not None and len(_paper_embedding_ids) > 0:
+    emb_matrix, emb_ids = embedding_snapshot()
+    if emb_matrix is not None and len(emb_ids) > 0:
         import numpy as np
         deduped_ids = [(p.get("id") or p.get("entry_id")) for p in deduped]
         deduped_to_emb = {}
+        emb_pos = {pid: i for i, pid in enumerate(emb_ids)}  # was .index() per paper: O(n^2)
         for di, pid in enumerate(deduped_ids):
-            if pid in _paper_embedding_ids:
-                deduped_to_emb[di] = _paper_embedding_ids.index(pid)
+            if pid in emb_pos:
+                deduped_to_emb[di] = emb_pos[pid]
         if len(deduped_to_emb) > 1:
             indices = list(deduped_to_emb.values())
-            emb_vectors = _paper_embeddings[indices]
+            emb_vectors = emb_matrix[indices]
             norms = np.linalg.norm(emb_vectors, axis=1, keepdims=True)
             sim_matrix = np.dot(emb_vectors, emb_vectors.T) / (norms * norms.T)
             deduped_indices = list(deduped_to_emb.keys())
@@ -1520,16 +1563,17 @@ def search_papers(papers, query, fields=None):
             keyword_scores[p.get("id") or p.get("entry_id")] = score
     _load_embeddings()
     embedding_scores = {}
-    if _paper_embeddings is not None and len(_paper_embeddings) > 0:
+    emb_matrix, emb_ids = embedding_snapshot()
+    if emb_matrix is not None and len(emb_matrix) > 0:
         query_emb = _get_embedding(query)
         if query_emb is not None:
             import numpy as np
             query_vec = np.array(query_emb)
-            norms = np.linalg.norm(_paper_embeddings, axis=1)
+            norms = np.linalg.norm(emb_matrix, axis=1)
             query_norm = np.linalg.norm(query_vec)
             if query_norm > 0:
-                similarities = np.dot(_paper_embeddings, query_vec) / (norms * query_norm)
-                for idx, pid in enumerate(_paper_embedding_ids):
+                similarities = np.dot(emb_matrix, query_vec) / (norms * query_norm)
+                for idx, pid in enumerate(emb_ids):
                     sim = float(similarities[idx])
                     if sim > 0:
                         embedding_scores[pid] = sim * 3.0
@@ -1639,7 +1683,8 @@ def run_scraper(query_key, count, sources=None, manage_flag=True):
             log_scraper(msg.strip())
             try:
                 _load_embeddings()
-                if _paper_embeddings is not None and len(_paper_embedding_ids) > 0:
+                _emb, _eids = embedding_snapshot()
+                if _emb is not None and len(_eids) > 0:
                     scored = score_papers_by_embedding(papers_global, query_key)
                     high_rel = sum(1 for _, s in scored if s > 0.7)
                     if high_rel > 0:
@@ -1786,9 +1831,10 @@ class Handler(SimpleHTTPRequestHandler):
                     except Exception:
                         pass
                 _load_embeddings()
-                has_embeddings = _paper_embeddings is not None and len(_paper_embedding_ids) > 0
+                emb_matrix, emb_ids = embedding_snapshot()
+                has_embeddings = emb_matrix is not None and len(emb_ids) > 0
                 total = len(papers_global) if papers_global else 0
-                count = len(_paper_embedding_ids) if has_embeddings else 0
+                count = len(emb_ids) if has_embeddings else 0
                 # Only "ready" if we have embeddings for ALL papers
                 ready = has_embeddings and count == total and total > 0
                 self._json({
@@ -1866,7 +1912,8 @@ class Handler(SimpleHTTPRequestHandler):
                 if q and len(q) >= 2:
                     if hybrid:
                         _load_embeddings()
-                        if _paper_embeddings is not None and len(_paper_embeddings) > 0:
+                        _emb, _ = embedding_snapshot()
+                        if _emb is not None and len(_emb) > 0:
                             hybrid_results = hybrid_search(q, result, top_k=50)
                             result = [next(p for p in result if (p.get("id") or p.get("entry_id")) == pid) for pid, _, _ in hybrid_results]
                         else:
@@ -2079,7 +2126,6 @@ class Handler(SimpleHTTPRequestHandler):
         return
 
     def do_POST(self):
-        global _paper_embeddings, _paper_embedding_ids
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         # int() on the raw header sat outside every try block: "Content-Length: abc"
@@ -2368,8 +2414,7 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json({"results": scored, "count": len(scored), "min_score": min_score})
 
             elif path == "/api/clear_embeddings":
-                _paper_embeddings = None
-                _paper_embedding_ids = []
+                _set_embeddings(None, [])
                 try:
                     if EMBEDDING_CACHE.exists():
                         EMBEDDING_CACHE.unlink()
