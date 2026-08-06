@@ -337,6 +337,17 @@ html[data-theme="light"] .topbar{background:oklch(0.97 0.008 275 / 0.97);}
 .tool-row input:focus,.tool-row select:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-bg);}
 .tool-row select option{background:var(--solid);color:var(--text);}
 
+/* ── Tool groups ───────────────────────── */
+.tool-group{margin-bottom:30px;}
+.tool-group:last-child{margin-bottom:0;}
+.tool-group > h2{display:flex;align-items:center;gap:11px;margin:0 2px 12px;font-family:var(--serif);font-size:17px;font-weight:600;letter-spacing:-.01em;color:var(--text);}
+.tool-group > h2::before{content:'';width:3px;height:17px;border-radius:99px;background:var(--accent);flex-shrink:0;}
+.tool-group > h2::after{content:'';flex:1;height:1px;background:var(--border);}
+.tool-group > h2 .tg-note{font-family:var(--sans);font-size:11px;font-weight:500;color:var(--text-3);}
+.tool-hint{font-size:11.5px;color:var(--text-3);background:var(--raise);border:1px solid var(--border);border-radius:9px;padding:8px 11px;margin-bottom:12px;line-height:1.5;}
+.tool-sub{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.1em;color:var(--text-4);margin:16px 0 9px;padding-top:14px;border-top:1px solid var(--border);}
+.tool-section > h3 + .tool-sub{margin-top:0;padding-top:0;border-top:none;}
+
 .q-chips{display:flex;flex-wrap:wrap;gap:6px;min-height:30px;padding:9px;background:oklch(0 0 0 / 0.12);border:1px solid var(--border);border-radius:11px;margin-bottom:10px;}
 html[data-theme="light"] .q-chips{background:oklch(0.2 0.02 275 / 0.04);}
 .q-chips:empty::after{content:'No queries yet — pick presets below or type your own.';font-size:11.5px;color:var(--text-4);font-style:italic;}
@@ -1918,36 +1929,61 @@ function clearLogs(){
 }
 function renderTools(keyInfo){
   let h = '';
+
+  // ── Setup ── Prerequisites. Both of these are consumed by tools further down the
+  // tab (the key by every AI feature, the embeddings by semantic search and the graph),
+  // so they render first: a first-time user meets them before anything that needs them.
+  h += '<div class="tool-group"><h2>Setup<span class="tg-note">Do these first — the rest of the tab depends on them</span></h2>';
+
   h += '<div class="tool-section"><h3>'+svg('<rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',2)+'LLM Configuration</h3>'
     + '<div class="tool-row"><label>API Key</label><input type="password" id="apiKeyInput" placeholder="sk-or-…" style="flex:1;min-width:200px;"><button class="btn" onclick="saveApiKey()">Save</button></div>'
     + '<div id="keyStatus" style="margin-left:87px;">'+(keyInfo&&keyInfo.has_key?'<span class="status-badge ok">✓ Key set</span>':'<span class="status-badge err">No key — AI features disabled</span>')+'</div></div>';
 
+  h += '<div class="tool-section"><h3>'+svg('<path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>',2)+'Embeddings</h3>'
+    + '<div class="tool-hint">Semantic Search and the Knowledge Graph (Embedding) both read these vectors — build embeddings before using either.</div>'
+    + '<div class="sec-desc">Semantic search requires paper embeddings. Build them first, then search by meaning.</div>'
+    + '<div class="emb-status-row"><span class="emb-status-dot" id="embedStatusDot"></span><span id="embedStatusText">Checking…</span></div>'
+    + '<div class="tool-row"><label>Provider</label><select id="embedProvider" class="fsel" onchange="onProviderChange()"><option value="gemini">Gemini Embedding 2 (multimodal, 3072-dim)</option><option value="openai">OpenAI text-embedding-3-small (1536-dim)</option></select></div>'
+    + '<div class="tool-row"><button class="btn" id="buildEmbedBtn" onclick="buildEmbeddings()">Build Embeddings</button><button class="btn btn-danger btn-sm" id="clearEmbedBtn" onclick="clearAndRebuild()">Clear & Rebuild</button></div>'
+    + '<div id="embedProgress" style="display:none;margin-top:8px;"><div class="progress-bar"><div class="progress-fill" id="embedProgressBar" style="width:0%"></div></div><div id="embedProgressText" style="font-size:11px;color:var(--text-4);margin-top:4px;"></div></div>'
+    + '<div style="font-size:11px;color:var(--text-4);margin-top:8px;">Gemini Embedding 2: $0.20/1M tokens. ~1500 papers ≈ $0.30. Free tier: 100 req/day. OpenAI: uses OpenRouter key.</div></div>';
+
+  h += '</div>';
+
+  // ── Collect ── The three concerns inside the scraper (what to search for, where to
+  // search, and running it) are separated by .tool-sub dividers; the DOM is otherwise
+  // untouched, so runScraper() still reads the same inputs.
+  h += '<div class="tool-group"><h2>Collect</h2>';
+
   h += '<div class="tool-section"><h3>'+svg('<circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/>',2)+'Paper Scraper</h3>'
+    + '<div class="tool-sub">Step 1 — What to search for</div>'
     + '<div class="q-chips" id="queryTags"></div><div class="presets-grid" id="presetsGrid">';
   for(const k in QUERY_GROUPS) h += '<button class="preset-btn" data-q="'+esc(k)+'" onclick="togglePreset(this,\''+esc(k).replace(/'/g,"\\'")+'\')" title="'+esc(QUERY_GROUPS[k])+'">'+esc(k)+'</button>';
   h += '</div>'
     + '<div class="tool-row" style="margin-bottom:6px;"><button class="btn btn-sec btn-sm" onclick="expandQuery()">Expand Query (AI)</button><span style="font-size:11px;color:var(--text-4);">Suggest related terms from embeddings</span></div>'
     + '<div id="expandedTerms" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px;min-height:28px;"></div>'
     + '<div class="q-row"><input type="text" id="scraperQueryCustom" placeholder="Type custom query terms, press Enter…"><button class="btn btn-sec" onclick="addCustomQuery()">+ Add</button></div>'
-    + '<div class="tool-row" style="margin-top:12px;"><label>Sources</label><div class="chk-group" style="flex-wrap:wrap;gap:8px;">'
+    + '<div class="tool-sub">Step 2 — Where to search</div>'
+    + '<div class="tool-row"><label>Sources</label><div class="chk-group" style="flex-wrap:wrap;gap:8px;">'
     // Rendered from ALL_SOURCES, which runScraper() also reads. Two hand-maintained
     // copies of this list meant any divergence became a null deref at scrape time.
     + ALL_SOURCES.map(s => '<label class="chk-item"><input type="checkbox" id="src'+s.id+'"'+(s.default?' checked':'')+'> '+esc(s.label)
         + (s.grey?' <span style="font-size:10px;color:var(--text-4);">(grey)</span>':'')+'</label>').join('')
     + '</div></div>'
+    + '<div class="tool-sub">Step 3 — Run</div>'
     + '<div class="tool-row"><label>Max each</label><input type="number" id="scraperMax" value="20" min="1" max="100" style="width:74px;">'
     + '<button class="btn" onclick="runScraper()">Run Scraper</button><button class="btn btn-sec" onclick="checkScraperStatus()">Status</button></div>'
     + '<div id="scraperLog" class="log" style="display:none;"></div></div>';
+
+  h += '</div>';
+
+  // ── Analyse ── Everything here consumes what Setup and Collect produced.
+  h += '<div class="tool-group"><h2>Analyse</h2>';
 
   h += '<div class="tool-section"><h3>'+svg('<path d="M12 3v3m0 12v3M3 12h3m12 0h3"/><circle cx="12" cy="12" r="3"/>',2)+'Batch AI Analysis</h3>'
     + '<div class="sec-desc">Analyse papers with AI to extract behavioural models, methodologies, and MENA relevance. Results are cached.</div>'
     + '<div class="tool-row"><label>Range</label><input type="number" id="batchStart" value="0" min="0" style="width:74px;"><label style="min-width:auto;">count</label><input type="number" id="batchCount" value="10" min="1" max="100" style="width:74px;"><button class="btn" id="batchBtn" onclick="runBatchAnalysis()">Run Analysis</button></div>'
     + '<div id="batchProgress" style="display:none;"><div class="progress-bar"><div class="progress-fill" id="batchProgressBar"></div></div><div id="batchStatus" style="font-size:11.5px;color:var(--text-4);margin-top:7px;"></div></div></div>';
-
-  h += '<div class="tool-section"><h3>'+svg('<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/>',2)+'Export Papers</h3>'
-    + '<div id="exportBanner" class="export-banner"></div>'
-    + '<div class="tool-row"><label>Format</label><select id="exportFormat" class="fsel"><option value="csv">CSV</option><option value="bibtex">BibTeX</option><option value="json">JSON</option></select></div>'
-    + '<div class="tool-row"><button class="btn" onclick="exportPapers(\'all\')">Export All</button><button class="btn btn-sec" onclick="exportPapers(\'search\')">Export Current Search</button></div></div>';
 
   h += '<div class="tool-section"><h3>'+svg('<circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/>',2)+'Semantic Search</h3>'
     + '<div class="sec-desc">Ranks papers by embedding similarity to your query rather than keyword overlap. Requires embeddings.</div>'
@@ -1958,31 +1994,43 @@ function renderTools(keyInfo){
     + '<div class="sec-desc">Build a semantic similarity graph from paper embeddings. Edges represent papers with cosine similarity > threshold.</div>'
     + '<div class="tool-row"><label>Threshold</label><input type="number" id="embedGraphThreshold" value="0.7" min="0.1" max="0.99" step="0.02" style="width:74px;">'
     + '<button class="btn" id="buildEmbedGraphBtn" onclick="buildEmbedGraphFromTools()">Build Semantic Graph</button></div>'
-    + '<div id="embedGraphStatus" style="font-size:11.5px;color:var(--text-4);margin-top:6px;"></div></div>'
-
-  + '<div class="tool-section"><h3>'+svg('<path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>',2)+'Embeddings</h3>'
-    + '<div class="sec-desc">Semantic search requires paper embeddings. Build them first, then search by meaning.</div>'
-    + '<div class="emb-status-row"><span class="emb-status-dot" id="embedStatusDot"></span><span id="embedStatusText">Checking…</span></div>'
-    + '<div class="tool-row"><label>Provider</label><select id="embedProvider" class="fsel" onchange="onProviderChange()"><option value="gemini">Gemini Embedding 2 (multimodal, 3072-dim)</option><option value="openai">OpenAI text-embedding-3-small (1536-dim)</option></select></div>'
-    + '<div class="tool-row"><button class="btn" id="buildEmbedBtn" onclick="buildEmbeddings()">Build Embeddings</button><button class="btn btn-danger btn-sm" id="clearEmbedBtn" onclick="clearAndRebuild()">Clear & Rebuild</button></div>'
-    + '<div id="embedProgress" style="display:none;margin-top:8px;"><div class="progress-bar"><div class="progress-fill" id="embedProgressBar" style="width:0%"></div></div><div id="embedProgressText" style="font-size:11px;color:var(--text-4);margin-top:4px;"></div></div>'
-    + '<div style="font-size:11px;color:var(--text-4);margin-top:8px;">Gemini Embedding 2: $0.20/1M tokens. ~1500 papers ≈ $0.30. Free tier: 100 req/day. OpenAI: uses OpenRouter key.</div></div>';
+    + '<div id="embedGraphStatus" style="font-size:11.5px;color:var(--text-4);margin-top:6px;"></div></div>';
 
   h += '<div class="tool-section"><h3>'+svg('<path d="M5 8h14M5 8a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v1a2 2 0 0 1-2 2M5 8v11a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8"/>',2)+'Arabic / MENA Papers</h3>'
     + '<div class="sec-desc">Find papers with Arabic content or strong MENA relevance via script detection and region keywords.</div>'
     + '<div class="tool-row"><label>Min score</label><input type="number" id="arabicMinScore" value="3" min="1" max="20" style="width:74px;"><button class="btn" onclick="findArabicPapers()">Find Papers</button></div>'
     + '<div id="arabicResults" style="margin-top:12px;"></div></div>';
 
+  h += '</div>';
+
+  // ── Data ── Getting the corpus back out, and what you have already asked of it.
+  h += '<div class="tool-group"><h2>Data</h2>';
+
+  h += '<div class="tool-section"><h3>'+svg('<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/>',2)+'Export Papers</h3>'
+    + '<div id="exportBanner" class="export-banner"></div>'
+    + '<div class="tool-row"><label>Format</label><select id="exportFormat" class="fsel"><option value="csv">CSV</option><option value="bibtex">BibTeX</option><option value="json">JSON</option></select></div>'
+    + '<div class="tool-row"><button class="btn" onclick="exportPapers(\'all\')">Export All</button><button class="btn btn-sec" onclick="exportPapers(\'search\')">Export Current Search</button></div></div>';
+
   h += '<div class="tool-section"><h3>'+svg('<path d="M12 8v4l3 2"/><circle cx="12" cy="12" r="9"/>',2)+'Search History</h3>'
     + '<div id="searchHistoryList" style="max-height:200px;overflow:auto;margin-bottom:12px;"></div><button class="btn btn-sec" onclick="clearSearchHistory()">Clear History</button></div>';
 
+  h += '</div>';
+
+  // ── Diagnostics ── Server controls and logs. The keyboard-shortcuts button used to
+  // live in here; it is not a server control, so it now sits on its own at the foot of
+  // the tab.
+  h += '<div class="tool-group"><h2>Diagnostics</h2>';
+
   h += '<div class="tool-section"><h3>'+svg('<rect x="2" y="4" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="6" rx="2"/><path d="M6 8h.01M6 17h.01"/>',2)+'Server</h3>'
-    + '<div class="tool-row"><button class="btn btn-sec" onclick="checkServerStatus()">Check Status</button><button class="btn btn-danger" onclick="shutdownServer()">Shutdown</button><span id="serverStatusTool" style="font-size:11.5px;"></span></div>'
-    + '<div style="margin-top:10px;"><button class="btn btn-ghost btn-sm" onclick="toggleShortcutModal()">Keyboard shortcuts</button></div></div>';
+    + '<div class="tool-row"><button class="btn btn-sec" onclick="checkServerStatus()">Check Status</button><button class="btn btn-danger" onclick="shutdownServer()">Shutdown</button><span id="serverStatusTool" style="font-size:11.5px;"></span></div></div>';
 
   h += '<div class="tool-section"><h3>'+svg('<path d="M4 4h16a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z"/><path d="M8 8h8M8 12h8M8 16h5"/>',2)+'Server Logs</h3>'
     + '<div class="tool-row"><button class="btn btn-sec" onclick="fetchLogs()">Refresh Logs</button><button class="btn btn-ghost btn-sm" onclick="clearLogs()">Clear</button><span id="logsStatus" style="font-size:11.5px;color:var(--text-4);margin-left:auto;"></span></div>'
     + '<div id="logsDisplay" class="log" style="display:none;margin-top:11px;max-height:300px;"></div></div>';
+
+  h += '</div>';
+
+  h += '<div style="display:flex;justify-content:center;margin-top:4px;"><button class="btn btn-ghost btn-sm" onclick="toggleShortcutModal()">Keyboard shortcuts</button></div>';
 
   $('#tools-content').innerHTML = h;
   renderQueryTags(); syncPresetButtons(); renderSearchHistory(); fetchEmbedStatus();
