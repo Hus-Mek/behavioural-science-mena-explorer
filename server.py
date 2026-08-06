@@ -131,6 +131,7 @@ LLM_BASE_URL = "https://openrouter.ai/api/v1"
 # Chat context limits. One constant so the prompt, the citation validator and the
 # papers_used payload can never describe different lists.
 MAX_CONTEXT_PAPERS = 30
+MAX_ABSTRACT_CHARS = 2000
 # Neighbours each paper keeps in the similarity graph. See build_embedding_graph
 # for why this replaced an absolute cosine threshold.
 GRAPH_TOP_K = 8
@@ -915,30 +916,42 @@ def hybrid_search(query, papers, top_k=30):
                     if sim > 0:
                         semantic_scores[pid] = sim
 
-    combined = {}
-    for p in papers:
-        pid = p.get("id") or p.get("entry_id")
-        kw_score = keyword_scores.get(pid, 0)
-        sem_score = semantic_scores.get(pid, 0) * 3.0
-        final_score = kw_score * 0.4 + sem_score * 0.6
-        if final_score > 0:
-            combined[pid] = {
-                "score": final_score,
-                "keyword_score": kw_score,
-                "semantic_score": sem_score
-            }
+    # Reciprocal Rank Fusion instead of weighted raw scores.
+    #
+    # The old formula was kw*0.4 + (sem*3.0)*0.6, but the two scales are not
+    # comparable: semantic is a cosine so sem*3.0 is capped at 3.0, while keyword
+    # is 3 + word_overlap and unbounded. On a six-word query keyword reaches ~9
+    # (weighted 3.6) against semantic's maximum 1.8 -- so the nominal 40/60 split
+    # INVERTED to keyword-dominant exactly when the query was most specific. It is
+    # worse here than usual because these embeddings sit on a narrow band (median
+    # pairwise cosine 0.626), so the semantic magnitudes barely vary at all.
+    #
+    # RRF combines by RANK, discarding the incomparable magnitudes, and needs no
+    # weights to tune. k=60 is the standard constant.
+    RRF_K = 60
+    fused = {}
 
-    if not combined:
-        return sorted(keyword_scores.items(), key=lambda x: -x[1])[:top_k]
+    def _fuse(scores, label):
+        for rank, (pid, _s) in enumerate(sorted(scores.items(), key=lambda x: -x[1])):
+            entry = fused.setdefault(pid, {"score": 0.0, "keyword_rank": None, "semantic_rank": None})
+            entry["score"] += 1.0 / (RRF_K + rank + 1)
+            entry[label] = rank + 1
 
-    ranked = sorted(combined.items(), key=lambda x: -x[1]["score"])[:top_k]
-    results = []
-    for pid, scores in ranked:
-        paper = next((p for p in papers if (p.get("id") or p.get("entry_id")) == pid), None)
-        if paper:
-            results.append((pid, scores["score"], scores))
+    _fuse(keyword_scores, "keyword_rank")
+    _fuse(semantic_scores, "semantic_rank")
+    if not fused:
+        return []
 
-    return results
+    known = {(p.get("id") or p.get("entry_id")) for p in papers}
+    ranked = sorted(((pid, e) for pid, e in fused.items() if pid in known),
+                    key=lambda x: (-x[1]["score"], str(x[0])))[:top_k]
+    # Always 3-tuples. The old no-embeddings fallback returned 2-tuples while the
+    # normal path returned 3, so the caller's `for pid, score, scores in ...`
+    # raised ValueError whenever embeddings were missing but keywords matched.
+    return [(pid, entry["score"], dict(entry,
+                                       keyword_score=keyword_scores.get(pid, 0),
+                                       semantic_score=semantic_scores.get(pid, 0)))
+            for pid, entry in ranked]
 
 
 ARABIC_PATTERN = re.compile(r'[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]')
@@ -1752,7 +1765,10 @@ def llm_rag_chat(query, papers_context, history=None):
     papers_context = list(papers_context)[:MAX_CONTEXT_PAPERS]
     context_parts = []
     for i, p in enumerate(papers_context):
-        abstract = (p.get('summary') or '')[:500]
+        # Was 500, which is roughly the first third of a typical 1200-1800 char
+        # abstract -- cut mid-sentence, usually before the findings. MAX_ABSTRACT_CHARS
+        # keeps the whole abstract for almost every paper while still bounding the prompt.
+        abstract = (p.get('summary') or '')[:MAX_ABSTRACT_CHARS]
         context_parts.append(f"[Paper {i+1}] {p.get('title', '')}\n{abstract}")
     context = "\n\n".join(context_parts)
 
@@ -2328,7 +2344,12 @@ class Handler(SimpleHTTPRequestHandler):
                         _emb, _ = embedding_snapshot()
                         if _emb is not None and len(_emb) > 0:
                             hybrid_results = hybrid_search(q, result, top_k=50)
-                            result = [next(p for p in result if (p.get("id") or p.get("entry_id")) == pid) for pid, _, _ in hybrid_results]
+                            # A bare next() raised StopIteration -> 500 whenever a
+                            # ranked id was no longer in the corpus (stale embeddings
+                            # vs a deduped corpus -- exactly what embedding_status
+                            # calls "stale"). Build one lookup and skip misses.
+                            by_id = {(p.get("id") or p.get("entry_id")): p for p in result}
+                            result = [by_id[pid] for pid, _, _ in hybrid_results if pid in by_id]
                         else:
                             result = search_papers(result, q)
                     else:
