@@ -1200,19 +1200,49 @@ def _run_batch_job(job_id, papers):
                 "analysis": result
             })
         except Exception as e:
+            # A per-paper failure is recorded on the paper, NOT on the job. Setting
+            # job["error"] while status was still "running" made the frontend poller
+            # (which checks d.error first) declare the whole run failed and stop
+            # polling -- discarding the progress bar and the analyses already
+            # completed, while this thread carried on spending on the rest.
             results.append({
                 "id": paper.get("id"),
                 "title": paper.get("title"),
                 "analysis": {"error": str(e)}
             })
-            with batch_jobs_lock:
-                batch_jobs[job_id]["error"] = str(e)
+            logger.warning(f"batch {job_id}: paper {paper.get('id')} failed: {e}")
         with batch_jobs_lock:
             batch_jobs[job_id]["progress"] = i + 1
             batch_jobs[job_id]["results"] = results
+    failed = sum(1 for r in results if isinstance(r.get("analysis"), dict) and "error" in r["analysis"])
     with batch_jobs_lock:
         batch_jobs[job_id]["status"] = "done"
         batch_jobs[job_id]["progress"] = total
+        batch_jobs[job_id]["failed"] = failed
+        batch_jobs[job_id]["finished_at"] = time.time()
+    _prune_batch_jobs()
+
+
+BATCH_JOB_TTL = 3600
+
+
+def _prune_batch_jobs():
+    """Drop finished jobs after a TTL.
+
+    Each entry holds the full results list for its papers, and nothing ever removed
+    them, so a long-lived server accumulated every analysis it had ever run in RAM.
+    """
+    cutoff = time.time() - BATCH_JOB_TTL
+    with batch_jobs_lock:
+        stale = [jid for jid, j in batch_jobs.items()
+                 if j.get("status") == "done" and (j.get("finished_at") or 0) < cutoff]
+        for jid in stale:
+            batch_jobs.pop(jid, None)
+
+
+def _batch_job_running():
+    with batch_jobs_lock:
+        return any(j.get("status") == "running" for j in batch_jobs.values())
 
 def load_papers():
     files = sorted(RAW_DIR.glob("papers_*.json"))
@@ -1451,8 +1481,16 @@ def retry(max_attempts=3, base_delay=1, backoff=2):
         return wrapper
     return decorator
 
+# The frontend abandons a POST at 330s. retry(2) x a 300s per-call timeout x 4
+# models in the fallback chain was ~2400s worst case, so the browser gave up, the
+# user retried and started a SECOND full chain, while the abandoned first one kept
+# billing and holding a worker thread for ~40 minutes.
+LLM_DEADLINE_SECONDS = 240
+LLM_CALL_TIMEOUT = 110
+
+
 @retry(max_attempts=2, base_delay=1, backoff=2)
-def _llm_call_single(messages, model, max_tokens=600, temperature=0.3):
+def _llm_call_single(messages, model, max_tokens=600, temperature=0.3, timeout=None):
     api_key = get_api_key()
     if not api_key:
         return {"error": "No API key. Set it in the GUI Scraper tab or OPENROUTER_API_KEY env var."}
@@ -1468,7 +1506,7 @@ def _llm_call_single(messages, model, max_tokens=600, temperature=0.3):
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
     )
     try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
+        with urllib.request.urlopen(req, timeout=timeout or LLM_CALL_TIMEOUT) as resp:
             data = json.loads(resp.read())
         message = data.get("choices", [{}])[0].get("message", {})
         content = message.get("content") or message.get("reasoning") or ""
@@ -1492,9 +1530,16 @@ def _llm_call_single(messages, model, max_tokens=600, temperature=0.3):
 def llm_call(messages, max_tokens=600, temperature=0.3):
     models_to_try = [LLM_MODEL] + LLM_FALLBACK_MODELS
     last_error = None
+    deadline = time.monotonic() + LLM_DEADLINE_SECONDS
     for model in models_to_try:
+        remaining = deadline - time.monotonic()
+        if remaining <= 5:
+            last_error = last_error or "LLM deadline exceeded"
+            print(f"  LLM deadline reached; not trying {model}.")
+            break
         try:
-            result = _llm_call_single(messages, model, max_tokens, temperature)
+            result = _llm_call_single(messages, model, max_tokens, temperature,
+                                      timeout=min(LLM_CALL_TIMEOUT, remaining))
             if "error" in result:
                 last_error = result["error"]
                 print(f"  Model {model} failed: {last_error}. Trying fallback...")
@@ -1533,65 +1578,114 @@ def llm_summarise(paper):
     result = llm_call([{"role": "user", "content": prompt}], max_tokens=2000)
     if "error" in result:
         return result
-    content = result.get("content", "")
-    content = re.sub(r'^```(?:json)?\s*', '', content)
-    content = re.sub(r'\s*```$', '', content)
-    try:
-        parsed = json.loads(content)
-        if paper_id and "error" not in parsed:
-            save_paper_analysis(paper_id, parsed)
-        return parsed
-    except json.JSONDecodeError:
+    # `or`, not a get default: the reasoning model returns content=None, and
+    # .get("content", "") hands back that None rather than the default.
+    content = result.get("content") or result.get("reasoning") or ""
+    parsed = _parse_json_object(content)
+    if parsed is None:
         return {"error": "Failed to parse LLM response", "raw": content[:300]}
+    if paper_id and "error" not in parsed:
+        save_paper_analysis(paper_id, parsed)
+    return parsed
+
+def _parse_json_object(content):
+    """Pull a JSON object out of an LLM reply, or None.
+
+    The old strip was anchored (^``` and ```$), so a reasoning model prefixing
+    "Here is the JSON:" or adding a trailing note failed to parse and burned the
+    whole call. json.loads("null") or "42" also used to sail past the
+    JSONDecodeError guard and then raise AttributeError on .get(), turning a bad
+    reply into a 500 rather than a handled error.
+    """
+    if not content:
+        return None
+    text = content.strip()
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.S)
+    if fenced:
+        text = fenced.group(1).strip()
+    for candidate in (text, text[text.find("{"):text.rfind("}") + 1] if "{" in text and "}" in text else ""):
+        if not candidate:
+            continue
+        try:
+            parsed = json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _existing_cluster_list(existing):
+    """Accept either the cluster list or the whole {clusters, unclustered} object.
+
+    The frontend sends its entire stored object as `existing`, but this used to do
+    `for cl in existing_clusters`, which iterates a dict's KEYS -- so the first
+    iteration called "clusters".get(...) and raised AttributeError. Clustering has
+    therefore never succeeded on a second run; the button 500'd every time.
+    """
+    if isinstance(existing, dict):
+        existing = existing.get("clusters")
+    if not isinstance(existing, list):
+        return []
+    return [c for c in existing if isinstance(c, dict)]
+
 
 def llm_cluster_papers(papers, max_n=50, existing_clusters=None):
     papers = papers[:max_n]
-    existing_indices = set()
-    if existing_clusters:
-        for cl in existing_clusters:
-            existing_indices.update(cl.get("paper_indices", []))
-        papers = [p for i, p in enumerate(papers) if i not in existing_indices]
-    if len(papers) <= 50:
-        return _cluster_batch(papers, offset=0)
+    # Carry each paper's ORIGINAL index. Filtering out already-clustered papers
+    # renumbered the survivors 0..m-1, while the frontend maps the returned indices
+    # into the unfiltered PAPERS array -- so every index after the first run pointed
+    # at the wrong paper.
+    indexed = list(enumerate(papers))
+    already = set()
+    for cl in _existing_cluster_list(existing_clusters):
+        already.update(i for i in cl.get("paper_indices", []) if isinstance(i, int))
+    if already:
+        indexed = [(i, p) for i, p in indexed if i not in already]
+    if not indexed:
+        return {"clusters": [], "unclustered": []}
+
+    if len(indexed) <= 50:
+        return _cluster_batch(indexed)
 
     all_clusters = []
     seen_indices = set()
-    batch_size, overlap, step = 50, 10, 40
-    for start in range(0, len(papers), step):
-        batch = papers[start:start + batch_size]
+    unclustered = set()
+    batch_size, step = 50, 40
+    for start in range(0, len(indexed), step):
+        batch = indexed[start:start + batch_size]
         if len(batch) < 10:
             break
-        result = _cluster_batch(batch, offset=start)
+        result = _cluster_batch(batch)
         if "error" in result:
             return result
         for cl in result.get("clusters", []):
-            existing = next((c for c in all_clusters if c["name"] == cl["name"]), None)
-            if existing:
-                for idx in cl.get("paper_indices", []):
-                    if idx not in seen_indices:
-                        existing["paper_indices"].append(idx)
-                        seen_indices.add(idx)
-            else:
-                new_cl = dict(cl)
-                for idx in cl.get("paper_indices", []):
+            match = next((c for c in all_clusters if c["name"] == cl["name"]), None)
+            target = match if match else dict(cl, paper_indices=[])
+            for idx in cl.get("paper_indices", []):
+                if idx not in seen_indices:
+                    target["paper_indices"].append(idx)
                     seen_indices.add(idx)
-                all_clusters.append(new_cl)
+            if match is None:
+                all_clusters.append(target)
+        # Collected in the SAME pass. This used to run the whole batch loop a second
+        # time purely to gather `unclustered`, doubling the LLM calls (and the bill)
+        # on the most expensive endpoint, with a fresh non-deterministic generation
+        # that disagreed with the clusters just returned.
+        unclustered.update(result.get("unclustered", []))
+    return {"clusters": all_clusters, "unclustered": sorted(unclustered - seen_indices)}
 
-    all_unclustered = set()
-    for start in range(0, len(papers), step):
-        batch = papers[start:start + batch_size]
-        if len(batch) < 10:
-            break
-        result = _cluster_batch(batch, offset=start)
-        if "error" not in result:
-            all_unclustered.update(result.get("unclustered", []))
-    all_unclustered -= seen_indices
-    return {"clusters": all_clusters, "unclustered": list(all_unclustered)}
+def _cluster_batch(indexed_papers):
+    """Cluster one batch. `indexed_papers` is [(original_index, paper), ...].
 
-def _cluster_batch(papers, offset=0):
+    The model is shown local positions 0..n-1 and its answer is mapped back onto
+    the original corpus indices, so filtering earlier in the pipeline can no longer
+    shift what a returned index refers to.
+    """
+    local_to_original = [orig for orig, _ in indexed_papers]
     paper_summaries = []
-    for i, p in enumerate(papers):
-        title = p.get('title', '')
+    for i, (_orig, p) in enumerate(indexed_papers):
+        title = p.get('title') or ''
         abstract = (p.get('summary') or '')[:200]
         paper_summaries.append(f"[{i}] {title}\n{abstract}")
     context = "\n\n".join(paper_summaries)
@@ -1607,16 +1701,40 @@ def _cluster_batch(papers, offset=0):
     if "error" in result:
         return result
     content = result.get("content") or result.get("reasoning") or ""
-    content = re.sub(r'^```(?:json)?\s*', '', content)
-    content = re.sub(r'\s*```$', '', content)
-    try:
-        parsed = json.loads(content)
-    except json.JSONDecodeError:
+    parsed = _parse_json_object(content)
+    if parsed is None:
         return {"error": "Failed to parse LLM response", "raw": content[:300]}
-    for cl in parsed.get("clusters", []):
-        cl["paper_indices"] = [i + offset for i in cl.get("paper_indices", [])]
-    parsed["unclustered"] = [i + offset for i in parsed.get("unclustered", [])]
-    return parsed
+
+    n = len(local_to_original)
+
+    def _map(indices):
+        """Map model-supplied local positions to original indices, dropping junk.
+
+        Indices came straight back from the model with no bounds check, so a
+        hallucinated index sailed through and the frontend used it to subscript
+        PAPERS.
+        """
+        out = []
+        for i in indices if isinstance(indices, list) else []:
+            if isinstance(i, bool) or not isinstance(i, int):
+                continue
+            if 0 <= i < n:
+                out.append(local_to_original[i])
+        return out
+
+    clusters = []
+    for cl in (parsed.get("clusters") or []):
+        if not isinstance(cl, dict):
+            continue
+        mapped = _map(cl.get("paper_indices"))
+        if not mapped:
+            continue
+        clusters.append({
+            "name": str(cl.get("name") or "Unnamed cluster")[:80],
+            "description": str(cl.get("description") or "")[:400],
+            "paper_indices": mapped,
+        })
+    return {"clusters": clusters, "unclustered": _map(parsed.get("unclustered"))}
 
 def llm_batch_summarise(papers):
     results = []
@@ -2605,6 +2723,15 @@ class Handler(SimpleHTTPRequestHandler):
 
             elif path == "/api/summarise_all":
                 if not self._rate_check():
+                    return
+                # One batch at a time. There was no guard at all, unlike
+                # /api/scraper/run, and the rate limiter allows 10 POSTs/minute --
+                # so 10 rapid calls (or a page-reload loop) started 10 threads of up
+                # to 50 papers each: 500 uncached LLM analyses per minute,
+                # repeatable, with overlapping ranges racing on the same
+                # data/analyses/{id}.json files.
+                if _batch_job_running():
+                    self._json({"error": "A batch analysis is already running."}, status=409)
                     return
                 try:
                     start = int(data.get("start", 0))
