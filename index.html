@@ -1898,9 +1898,10 @@ function saveApiKey(){
 function checkServerStatus(){
   const el = $('#serverStatusTool'); el.innerHTML = '<span class="status-badge warn">Checking…</span>';
   const t = Date.now();
-  apiGet('/api/papers', (err, data)=>{
+  // /api/health, not /api/papers: pinging used to download the whole ~2.2MB corpus.
+  apiGet('/api/health', (err, data)=>{
     if(err){ el.innerHTML = '<span class="status-badge err">Offline</span>'; setSrv(false); }
-    else { el.innerHTML = '<span class="status-badge ok">Online — '+(data.count||0)+' papers · '+(Date.now()-t)+'ms</span>'; setSrv(true); }
+    else { el.innerHTML = '<span class="status-badge ok">Online — '+(data.papers||0)+' papers · '+(Date.now()-t)+'ms</span>'; setSrv(true); }
   });
 }
 function shutdownServer(){

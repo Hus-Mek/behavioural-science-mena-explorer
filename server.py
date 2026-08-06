@@ -10,6 +10,7 @@ import urllib.parse
 import csv
 import io
 import time
+import collections
 import hashlib
 import ipaddress
 import socket
@@ -84,7 +85,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 scraper_log_queue = queue.Queue()
-scraper_logs = []
+# Bounded. This was a plain list that log_scraper appended to forever and nothing
+# ever trimmed, so a long-lived server grew it without limit.
+scraper_logs = collections.deque(maxlen=2000)
 
 def log_scraper(msg):
     timestamp = datetime.now().strftime("%H:%M:%S")
@@ -93,7 +96,7 @@ def log_scraper(msg):
     logger.info(f"SCRAPER: {msg}")
 
 def get_scraper_logs():
-    return scraper_logs
+    return list(scraper_logs)   # a deque is not JSON-serialisable
 
 def load_config():
     if CONFIG_FILE.exists():
@@ -169,7 +172,13 @@ for d in [RAW_DIR, RESULTS_DIR]:
 PDF_DIR = ROOT / "data" / "pdfs"
 PDF_DIR.mkdir(parents=True, exist_ok=True)
 
+MAX_PDF_PAGES = 80
+MAX_PDF_TEXT_CHARS = 400_000
+
+
 def extract_pdf_text(pdf_path):
+    # Bounded: there was no page or character cap, and MAX_PDF_BYTES permits a 60MB
+    # PDF whose extracted text can run to hundreds of MB held in one handler thread.
     if DocumentConverter is not None:
         try:
             converter = DocumentConverter()
@@ -182,10 +191,15 @@ def extract_pdf_text(pdf_path):
     try:
         import fitz
         doc = fitz.open(pdf_path)
-        text = ""
-        for page in doc:
-            text += page.get_text()
+        parts = []          # was `text += ...`, quadratic string building
+        for i, page in enumerate(doc):
+            if i >= MAX_PDF_PAGES:
+                break
+            parts.append(page.get_text())
+            if sum(map(len, parts)) > MAX_PDF_TEXT_CHARS:
+                break
         doc.close()
+        text = "".join(parts)[:MAX_PDF_TEXT_CHARS]
         if text.strip():
             return text.strip()
     except ImportError:
@@ -316,6 +330,11 @@ def download_pdf_with_fallback(paper, paper_id, grey=False):
 def get_paper_full_text(paper, grey=False):
     paper_id = paper.get("id") or paper.get("entry_id") or ""
     safe_id = re.sub(r'[^a-zA-Z0-9._-]', '_', str(paper_id))
+    if not safe_id.strip("_"):
+        # An id-less paper produced cache paths of ".txt"/".pdf", so EVERY such
+        # paper shared one slot and the first one cached became sticky -- returning
+        # the wrong paper's text to the UI and into LLM prompts.
+        return {"error": "Paper has no usable id; cannot fetch full text."}
     cache_path = PDF_DIR / f"{safe_id}.txt"
     if cache_path.exists():
         try:
@@ -817,14 +836,39 @@ def load_or_build_merged_graph():
     return merged
 
 
+MAX_KEYWORD_GRAPH_BYTES = 64 * 1024 * 1024
+_keyword_graph_cache = {"mtime": None, "data": None}
+
+
+def _load_keyword_graph():
+    """Load graphify's keyword graph, cached on mtime.
+
+    It is a 22MB file that was re-read and re-parsed on every request that touched
+    it, with the handle never closed.
+    """
+    if not KEYWORD_GRAPH_PATH.exists():
+        return None
+    try:
+        stat = KEYWORD_GRAPH_PATH.stat()
+        if stat.st_size > MAX_KEYWORD_GRAPH_BYTES:
+            print(f"  Keyword graph too large ({stat.st_size} bytes); ignoring.")
+            return None
+        if _keyword_graph_cache["mtime"] == stat.st_mtime:
+            return _keyword_graph_cache["data"]
+        with open(KEYWORD_GRAPH_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return None
+        _keyword_graph_cache.update(mtime=stat.st_mtime, data=data)
+        return data
+    except Exception as e:
+        print(f"  Could not load keyword graph: {e}")
+        return None
+
+
 def merge_graphs():
     emb_graph = load_or_build_embedding_graph()
-    kw_graph = None
-    if KEYWORD_GRAPH_PATH.exists():
-        try:
-            kw_graph = json.load(open(KEYWORD_GRAPH_PATH, encoding="utf-8"))
-        except Exception as e:
-            print(f"  Could not load keyword graph: {e}")
+    kw_graph = _load_keyword_graph()
 
     if emb_graph is None and kw_graph is None:
         return {"error": "No graphs available"}
@@ -838,38 +882,88 @@ def merge_graphs():
     if kw_graph is None:
         return emb_graph
 
+    # The external keyword graph is third-party output; validate rather than
+    # subscript. A missing "id"/"source"/"target" used to raise KeyError straight
+    # out of the handler.
+    def _valid_nodes(graph):
+        return [n for n in (graph.get("nodes") or [])
+                if isinstance(n, dict) and isinstance(n.get("id"), str)]
+
+    def _valid_edges(graph):
+        return [e for e in (graph.get("edges") or [])
+                if isinstance(e, dict) and isinstance(e.get("source"), str)
+                and isinstance(e.get("target"), str)]
+
     all_nodes = {}
-    for n in emb_graph.get("nodes", []):
+    for n in _valid_nodes(emb_graph):
         all_nodes[n["id"]] = n
-    for n in kw_graph.get("nodes", []):
+    for n in _valid_nodes(kw_graph):
         if n["id"] not in all_nodes:
-            all_nodes[n["id"]] = n
+            # Normalise to the embedding node schema; keyword nodes carry
+            # label/abstract and no community, and the renderer colours by
+            # community. The abstract is dropped too -- copying it verbatim was
+            # most of the 18MB payload.
+            all_nodes[n["id"]] = {
+                "id": n["id"],
+                "title": n.get("title") or n.get("label") or "",
+                "year": n.get("year") or "",
+                "domain": n.get("domain") or "paper",
+                "community": n.get("community", -1),
+            }
 
     all_edges = []
-    seen = set()
-    for e in emb_graph.get("edges", []):
-        key = (e["source"], e["target"])
-        if key not in seen:
-            seen.add(key)
-            seen.add((e["target"], e["source"]))
+    # id -> edge, so a duplicate is an O(1) lookup. This used to scan all_edges
+    # linearly for every duplicate keyword edge: 13,525 duplicates against ~70-135k
+    # edges is ~1e9 tuple comparisons, inside a GET handler.
+    edge_index = {}
+
+    def _key(e):
+        return (e["source"], e["target"]) if e["source"] <= e["target"] else (e["target"], e["source"])
+
+    for e in _valid_edges(emb_graph):
+        k = _key(e)
+        if k not in edge_index:
             e["type"] = "semantic"
+            edge_index[k] = e
             all_edges.append(e)
 
-    for e in kw_graph.get("edges", []):
-        key = (e["source"], e["target"])
-        if key not in seen:
-            seen.add(key)
-            seen.add((e["target"], e["source"]))
+    # The keyword graph is as dense as the old threshold-based semantic graph was:
+    # 71,215 edges here, which makes the merged view exactly the hairball that kept
+    # the semantic view from rendering. Apply the same rule -- each node keeps its
+    # strongest keyword links -- so "merged" stays drawable. Edges that duplicate a
+    # semantic edge are always kept, since those are the interesting ones.
+    kw_edges = _valid_edges(kw_graph)
+    kept_kw, per_node = [], collections.Counter()
+    for e in sorted(kw_edges, key=lambda x: -(x.get("weight") or 0)):
+        k = _key(e)
+        if k in edge_index:
+            kept_kw.append(e)      # overlaps a semantic edge; keep regardless
+            continue
+        if per_node[e["source"]] >= GRAPH_TOP_K or per_node[e["target"]] >= GRAPH_TOP_K:
+            continue
+        per_node[e["source"]] += 1
+        per_node[e["target"]] += 1
+        kept_kw.append(e)
+
+    for e in kept_kw:
+        k = _key(e)
+        existing = edge_index.get(k)
+        if existing is None:
             e["type"] = "keyword"
+            edge_index[k] = e
             all_edges.append(e)
-        else:
-            existing = next(
-                (x for x in all_edges if (x["source"] == e["source"] and x["target"] == e["target"])
-                 or (x["source"] == e["target"] and x["target"] == e["source"])),
-                None
-            )
-            if existing and existing.get("type") == "semantic":
-                existing["type"] = "both"
+        elif existing.get("type") == "semantic":
+            existing["type"] = "both"
+            # Keep BOTH weights. Only `type` was upgraded before, so the keyword
+            # weight and shared_concepts were discarded on all 13,525 shared edges
+            # and the merged view's weights were purely semantic despite the label.
+            existing["semantic_weight"] = existing.get("weight")
+            existing["keyword_weight"] = e.get("weight")
+            if e.get("shared_concepts"):
+                existing["shared_concepts"] = e["shared_concepts"]
+
+    # Drop edges whose endpoints aren't nodes; dangling ids reach the renderer.
+    all_edges = [e for e in all_edges if e["source"] in all_nodes and e["target"] in all_nodes]
 
     return {
         "directed": False,
@@ -1588,6 +1682,7 @@ def llm_summarise(paper):
         '- "future_research": list of future research directions mentioned (empty list if none)\n\n'
         "Respond ONLY with valid JSON, no markdown fences."
     )
+    prompt = get_prompt("summarise", prompt)   # prompts.json override
     result = llm_call([{"role": "user", "content": prompt}], max_tokens=2000)
     if "error" in result:
         return result
@@ -1710,6 +1805,7 @@ def _cluster_batch(indexed_papers):
         "Respond in JSON: {\"clusters\": [{\"name\": \"...\", \"description\": \"...\", \"paper_indices\": [0,3]}], \"unclustered\": [1,5]}\n"
         "Respond ONLY with valid JSON, no markdown fences."
     )
+    prompt = get_prompt("cluster", prompt)     # prompts.json override
     result = llm_call([{"role": "user", "content": prompt}], max_tokens=2000, temperature=0.2)
     if "error" in result:
         return result
@@ -1784,6 +1880,7 @@ def llm_rag_chat(query, papers_context, history=None):
         "- If you are unsure, say 'The available papers do not cover this topic.'\n"
         "Be concise but thorough. Use bullet points where appropriate."
     )
+    system_msg = get_prompt("chat_system", system_msg)   # prompts.json override
     user_msg = (
         f"Based on the following {len(papers_context)} paper abstracts, answer this question:\n\n"
         f"Question: {query}\n\n"
@@ -2321,15 +2418,28 @@ class Handler(SimpleHTTPRequestHandler):
                 return
 
             elif path == "/api/graph_stats":
-                graph = load_or_build_embedding_graph()
+                # Cache-only. This used to call load_or_build_embedding_graph(), so a
+                # stats request on a cold cache synchronously ran the full graph
+                # build with no timeout -- and every refresh spawned another thread
+                # starting its own build.
+                graph = None
+                if EMBEDDING_GRAPH_CACHE.exists():
+                    try:
+                        cached = json.load(open(EMBEDDING_GRAPH_CACHE, encoding="utf-8"))
+                        if _graph_cache_is_current(cached):
+                            graph = cached
+                    except Exception:
+                        graph = None
                 if graph is None or "error" in graph:
-                    self._json({"nodes": 0, "edges": 0, "communities": 0, "avg_degree": 0})
+                    self._json({"ready": False, "nodes": 0, "edges": 0,
+                                "communities": 0, "avg_degree": 0})
                     return
                 nodes = len(graph.get("nodes", []))
                 edges = len(graph.get("edges", []))
                 communities = graph.get("meta", {}).get("communities", 0)
                 avg_degree = round(2 * edges / nodes, 2) if nodes > 0 else 0
-                self._json({"nodes": nodes, "edges": edges, "communities": communities, "avg_degree": avg_degree})
+                self._json({"ready": True, "nodes": nodes, "edges": edges,
+                            "communities": communities, "avg_degree": avg_degree})
                 return
 
             elif path == "/api/papers":
@@ -2405,10 +2515,30 @@ class Handler(SimpleHTTPRequestHandler):
                 })
                 return
 
+            elif path == "/api/paper_graph":
+                # Moved here from do_POST, where it was unreachable by GET and 404'd
+                # through the static handler. Cached rather than re-reading and
+                # re-serialising a 22MB file per request.
+                graph_data = _load_keyword_graph()
+                if graph_data is None:
+                    self._json({"error": "Paper graph not found. Build with: "
+                                         "python build_paper_graph.py"}, status=404)
+                else:
+                    self._json(graph_data)
+                return
+
+            elif path == "/api/health":
+                # Tiny liveness probe. The Tools tab used to ping by fetching
+                # /api/papers, downloading the entire ~2.2MB corpus to measure
+                # latency.
+                self._json({"ok": True, "papers": len(papers_global) if papers_global else 0})
+                return
+
             elif path == "/api/logs":
                 self._json({
                     "scraper_logs": get_scraper_logs(),
-                    "server_log_path": str(LOG_FILE)
+                    # Name only: the absolute path disclosed the OS username.
+                    "server_log_path": LOG_FILE.name,
                 })
                 return
 
@@ -2588,7 +2718,19 @@ class Handler(SimpleHTTPRequestHandler):
         logger.info(f"POST {path} from {self.client_address[0]}")
         try:
             if path == "/api/config/key":
-                key = data.get("key", "").strip()
+                if not self._rate_check():
+                    return
+                key = data.get("key")
+                # Anything at all used to be written straight to config.json, and a
+                # body that failed to parse left data={} -> key="" -> the key was
+                # silently cleared.
+                if not isinstance(key, str) or not key.strip():
+                    self._json({"error": "A non-empty key string is required."}, status=400)
+                    return
+                key = key.strip()
+                if len(key) < 20 or any(c.isspace() for c in key):
+                    self._json({"error": "That does not look like an API key."}, status=400)
+                    return
                 cfg = load_config()
                 cfg["openrouter_api_key"] = key
                 save_config(cfg)
@@ -2801,16 +2943,6 @@ class Handler(SimpleHTTPRequestHandler):
                     "error": job["error"]
                 })
 
-            elif path == "/api/paper_graph":
-                graph_path = ROOT / "graphify-out" / "paper_graph.json"
-                if graph_path.exists():
-                    try:
-                        graph_data = json.load(open(graph_path, encoding="utf-8"))
-                        self._json(graph_data)
-                    except Exception as e:
-                        self._json({"error": str(e)})
-                else:
-                    self._json({"error": "Paper graph not found. Build with: python build_paper_graph.py"})
                 return
 
             elif path == "/api/embedding_graph":
