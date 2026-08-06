@@ -955,12 +955,20 @@ ARABIC_KEYWORDS = [
 ]
 
 def detect_arabic_content(text):
+    """Return (is_relevant, keywords, has_script).
+
+    The first value was `has_script or keywords`, but score_arabic_relevance bound
+    it as `has_script` and then tagged the paper "arabic_script" and added +5. So a
+    pure-English paper mentioning "arab" was reported as containing Arabic script
+    with not one Arabic character in it. Script presence is now returned separately
+    from keyword relevance.
+    """
     if not text:
-        return False, []
+        return False, [], False
     has_script = bool(ARABIC_PATTERN.search(text))
     text_lower = text.lower()
-    found_keywords = [kw for kw in ARABIC_KEYWORDS if kw in text_lower]
-    return has_script or len(found_keywords) > 0, found_keywords
+    found_keywords = [kw for kw in ARABIC_KEYWORDS if _term_pattern(kw).search(text_lower)]
+    return (has_script or bool(found_keywords)), found_keywords, has_script
 
 def score_arabic_relevance(paper):
     title = (paper.get("title") or "").lower()
@@ -968,15 +976,14 @@ def score_arabic_relevance(paper):
     text = title + " " + summary
     score = 0
     details = []
-    has_script, script_words = detect_arabic_content(text)
+    _relevant, script_words, has_script = detect_arabic_content(text)
     if has_script:
         score += 5
         details.append("arabic_script")
-    for kw in ARABIC_KEYWORDS:
-        if kw in text:
-            score += 1
-            if kw not in details:
-                details.append(kw)
+    for kw in script_words:   # already word-boundary matched by detect_arabic_content
+        score += 1
+        if kw not in details:
+            details.append(kw)
     country_terms = {
         "saudi": 3, "arabia": 3, "uae": 3, "emirati": 3, "qatar": 3, "kuwait": 3,
         "bahrain": 3, "oman": 3, "egypt": 3, "jordan": 3, "lebanon": 3, "iraq": 3,
@@ -985,10 +992,10 @@ def score_arabic_relevance(paper):
         "mena": 4, "middle east": 4, "gulf": 3, "arabian": 3,
     }
     for term, boost in country_terms.items():
-        if term in text:
+        if _term_pattern(term).search(text):   # was substring: "oman" hit "Romania"
             score += boost
             details.append(term)
-    return score, list(set(details))
+    return score, sorted(set(details))
 
 BEHAVIOURAL_TERMS = [
     "nudge","nudging","behavior","behaviour","cognitive","decision",
@@ -1004,17 +1011,29 @@ BEHAVIOURAL_TERMS = [
     "reciprocity","authority","scarcity","social proof","liking",
 ]
 
-MIDDLE_EAST_TERMS = [
+# Split deliberately. The original single list mixed place names with generic
+# sociology vocabulary, and since the dashboard's "Regional Keywords" panel ranks
+# by raw frequency, the generic words buried every actual regional signal.
+MENA_PLACE_TERMS = [
     "saudi","arabia","uae","emirati","dubai","abu dhabi","riyadh",
     "jeddah","mecca","medina","qatar","doha","kuwait","bahrain",
     "oman","muscat","egypt","cairo","jordan","amman","lebanon",
     "beirut","iraq","baghdad","iran","israel","palestine","gaza",
-    "middle east","mena","gulf","arab","islamic","muslim",
-    "conservative","liberal","tribe","tribal","honor","shame",
+    "syria","yemen","morocco","tunisia","algeria","libya","sudan",
+    "middle east","mena","gulf","gcc","levant","maghreb",
+    "arab","arabic","islamic","muslim","vision 2030","neom",
+]
+
+# Retained, but reported separately as context rather than as "regional keywords".
+MENA_CONTEXT_TERMS = [
+    "conservative","liberal","tribe","tribal","honor","honour","shame",
     "collectivism","individualism","religion","cultural","context",
     "hijab","veil","gender","women","youth","unemployment",
-    "vision 2030","neom","diversification","oil","expat","foreign worker",
+    "diversification","oil","expat","foreign worker",
 ]
+
+# Kept for backwards compatibility with anything referencing the old name.
+MIDDLE_EAST_TERMS = MENA_PLACE_TERMS + MENA_CONTEXT_TERMS
 
 SCRAPER_QUERIES = {
     "broad_behavioural": {"source": "arXiv", "desc": "Behavioral Science (broad)"},
@@ -1401,10 +1420,18 @@ def word_freq(texts, stopwords=None, min_len=3):
             "much","many","well","still","most","those","using","based","paper",
             "study","research","result","used","show","found","find","present",
             "propose","model","approach","method","data","experiment","analysis"}
+        stopwords = stopwords | ARABIC_STOPWORDS
+    # [a-zA-Z] matched ASCII letters only, so every Arabic token was silently
+    # dropped and this -- the headline keyword analysis of a MENA-focused tool --
+    # was structurally English-only. "naive"/"cafe" lost their accented forms too.
+    # [^\W\d_] is "any unicode letter", so Arabic and accented Latin both survive.
+    pattern = re.compile(r"[^\W\d_]{%d,}" % min_len, re.UNICODE)
     words = []
     for text in texts:
-        tokens = re.findall(r"\b[a-zA-Z]{%d,}\b" % min_len, text.lower())
-        words.extend([w for w in tokens if w not in stopwords])
+        for token in pattern.findall((text or "").lower()):
+            token = _normalise_arabic(token)
+            if token and token not in stopwords:
+                words.append(token)
     return Counter(words).most_common(200)
 
 def retry(max_attempts=3, base_delay=1, backoff=2):
@@ -1635,58 +1662,164 @@ def llm_rag_chat(query, papers_context, history=None):
     result = llm_call(msgs, max_tokens=2000, temperature=0.2)
     return result
 
+MIN_PLAUSIBLE_YEAR = 1900
+
+# Common Arabic function words. Without these the Arabic keyword ranking would be
+# dominated by "من/في/على" exactly as an English one would be by "the/and/of".
+ARABIC_STOPWORDS = {
+    "من", "في", "على", "الى", "إلى", "عن", "مع", "هذا", "هذه", "ذلك", "التي",
+    "الذي", "كان", "كانت", "قد", "لم", "لا", "ما", "أن", "إن", "او", "أو",
+    "ثم", "كما", "بين", "بعد", "قبل", "عند", "حيث", "كل", "بعض", "غير",
+    "هو", "هي", "هم", "نحن", "انت", "أنت", "لكن", "حتى", "اذا", "إذا",
+}
+
+# Alef and yeh/teh-marbuta variants are written inconsistently across sources, so
+# the same word arrives in several forms and would otherwise be counted separately.
+_ARABIC_NORMALISE = str.maketrans({"أ": "ا", "إ": "ا", "آ": "ا", "ى": "ي", "ة": "ه"})
+_ARABIC_DIACRITICS = re.compile(r"[ؐ-ًؚ-ٰٟۖ-ۭـ]")
+_HAS_ARABIC = re.compile(r"[؀-ۿ]")
+
+
+def _normalise_arabic(token):
+    if not _HAS_ARABIC.search(token):
+        return token
+    return _ARABIC_DIACRITICS.sub("", token).translate(_ARABIC_NORMALISE)
+
+
+_TERM_PATTERNS = {}
+
+
+def _term_pattern(term):
+    """Word-boundary matcher for a term, cached.
+
+    Multi-word terms ("middle east", "abu dhabi") need internal whitespace to stay
+    flexible; \\b at each end stops "mena" matching phenoMENA.
+    """
+    pat = _TERM_PATTERNS.get(term)
+    if pat is None:
+        pat = re.compile(r"\b" + r"\s+".join(re.escape(w) for w in term.split()) + r"\b")
+        _TERM_PATTERNS[term] = pat
+    return pat
+
+
+def _count_terms(text, terms):
+    counts = {t: len(_term_pattern(t).findall(text)) for t in terms}
+    return sorted(((t, c) for t, c in counts.items() if c > 0), key=lambda x: -x[1])
+
+
+def _author_names(paper):
+    """Authors as a clean list of strings, whatever shape the source produced."""
+    raw = paper.get("authors")
+    if isinstance(raw, str):
+        return [a.strip() for a in raw.split(";") if a.strip()]
+    if not isinstance(raw, list):
+        return []
+    names = []
+    for a in raw:
+        if isinstance(a, str) and a.strip():
+            names.append(a.strip())
+        elif isinstance(a, dict):
+            name = a.get("name") or f"{a.get('given','')} {a.get('family','')}".strip()
+            if name:
+                names.append(name)
+    return names
+
+
+def _paper_brief(paper):
+    """Summary record used by concept_clusters and most_collaborative.
+
+    Both used to subscript p["id"] and p["title"] directly. analyze_papers runs at
+    startup BEFORE the socket binds, so one record missing either key took the whole
+    server down with a traceback and no port ever opened.
+    """
+    names = _author_names(paper)
+    return {
+        "id": paper.get("id") or paper.get("entry_id") or "",
+        "title": paper.get("title") or "",
+        "year": (paper.get("published") or "")[:4],
+        "authors": names,
+        "count": len(names),
+    }
+
+
+def _plausible_year(year):
+    """Papers dated in the future are scraper artefacts, not publications.
+
+    The live corpus carries 2116, 2117 and 2121 dates, which put phantom buckets on
+    the timeline and made date_range read "2008-02-01 -> 2121-01-01".
+    """
+    return MIN_PLAUSIBLE_YEAR <= year <= datetime.now().year + 1
+
+
 def analyze_papers(papers):
     results = {"generated_at": datetime.now().isoformat(), "total_papers": len(papers)}
     years = Counter()
     months = Counter()
     dates_raw = []
+    implausible = 0
     for p in papers:
-        pub = p.get("published", "")
+        pub = p.get("published") or ""   # .get(k, "") returns None on a JSON null
         if pub:
             try:
-                dt = datetime.fromisoformat(pub.replace("Z", "+00:00"))
+                dt = datetime.fromisoformat(str(pub).replace("Z", "+00:00"))
                 dt = dt.replace(tzinfo=None)
+                if not _plausible_year(dt.year):
+                    implausible += 1
+                    continue
                 years[dt.year] += 1
                 months[f"{dt.year}-{dt.month:02d}"] += 1
                 dates_raw.append(dt)
             except Exception:
                 pass
+    if implausible:
+        results["implausible_dates"] = implausible
     results["yearly_distribution"] = dict(years.most_common())
     results["monthly_distribution"] = dict(sorted(months.items()))
     results["date_range"] = {
         "earliest": str(min(dates_raw).date()) if dates_raw else None,
         "latest": str(max(dates_raw).date()) if dates_raw else None,
     }
+    # authors can arrive as null (TypeError on iteration), as a "A; B" string
+    # (iterates characters, filling top_authors with single letters), or as a list
+    # of dicts (unhashable -> TypeError). Coerce once, here.
     all_authors = []
     author_counts = Counter()
+    author_totals = []
     for p in papers:
-        for a in p.get("authors", []):
+        names = _author_names(p)
+        author_totals.append(len(names))
+        for a in names:
             all_authors.append(a)
             author_counts[a] += 1
     results["total_authors"] = len(set(all_authors))
     results["avg_authors_per_paper"] = round(
-        sum(len(p.get("authors", [])) for p in papers) / len(papers), 2
+        sum(author_totals) / len(papers), 2
     ) if papers else 0
     results["top_authors"] = author_counts.most_common(20)
     results["top_title_keywords"] = word_freq([(p.get("title") or "") for p in papers], min_len=3)[:30]
     results["top_abstract_keywords"] = word_freq([(p.get("summary") or "") for p in papers], min_len=4)[:30]
     combined = " ".join(((p.get("title") or "") + " " + (p.get("summary") or "")).lower() for p in papers)
-    results["behavioural_term_freq"] = sorted(
-        {t: combined.count(t) for t in BEHAVIOURAL_TERMS if combined.count(t) > 0}.items(), key=lambda x: -x[1])
-    results["region_term_freq"] = sorted(
-        {t: combined.count(t) for t in MIDDLE_EAST_TERMS if combined.count(t) > 0}.items(), key=lambda x: -x[1])
+    # Word-boundary counts, not substring: "mena" was matching phenoMENA and "arab"
+    # matched ARABidopsis, inflating every regional figure.
+    results["behavioural_term_freq"] = _count_terms(combined, BEHAVIOURAL_TERMS)
+    # Place names only. MIDDLE_EAST_TERMS also carries generic sociology vocabulary
+    # (context, cultural, gender, women, religion, oil, youth...), which appears in
+    # behavioural-science abstracts constantly and swamped the panel: the live top
+    # six read context 272, women 145, cultural 132, arab 101, oil 68, gender 65 --
+    # measuring vocabulary, not the region.
+    results["region_term_freq"] = _count_terms(combined, MENA_PLACE_TERMS)
+    results["region_context_term_freq"] = _count_terms(combined, MENA_CONTEXT_TERMS)
+
     clusters = {}
     for term in BEHAVIOURAL_TERMS:
-        related = [{"id": p["id"], "title": p["title"],
-                    "year": p.get("published","")[:4], "authors": p.get("authors",[])}
-                   for p in papers if term in ((p.get("title") or "") + " " + (p.get("summary") or "")).lower()]
+        pattern = _term_pattern(term)
+        related = [_paper_brief(p) for p in papers
+                   if pattern.search(((p.get("title") or "") + " " + (p.get("summary") or "")).lower())]
         if len(related) >= 2:
             clusters[term] = related
     results["concept_clusters"] = dict(sorted(clusters.items(), key=lambda x: -len(x[1])))
     results["most_collaborative"] = sorted(
-        [{"title": p["title"], "authors": p.get("authors",[]),
-          "count": len(p.get("authors",[])), "year": p.get("published","")[:4]}
-         for p in papers], key=lambda x: -x["count"])[:10]
+        (_paper_brief(p) for p in papers), key=lambda x: -x["count"])[:10]
     results["summary"] = {
         "total_papers": len(papers),
         "date_range": f"{results['date_range']['earliest']} -> {results['date_range']['latest']}",
