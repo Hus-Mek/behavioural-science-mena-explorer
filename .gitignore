@@ -10,10 +10,24 @@ venv/
 # Config with secrets
 config.json
 
-# Data (large files)
+# Data (large files / generated artifacts)
 data/raw/papers_*.json
 data/analyses/
 data/analysis_cache.json
+data/embeddings.json
+data/embeddings_meta.json
+data/embedding_graph.json
+data/merged_graph.json
+data/results/
+results/
+
+# Local tooling and session artifacts
+.claude/
+.hermes/
+.impeccable.md
+Sessions/
+graphify-out/
+*.err
 
 # OS
 .DS_Store
