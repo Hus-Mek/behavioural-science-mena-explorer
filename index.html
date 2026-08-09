@@ -1175,7 +1175,7 @@ function sendChat(){
   log.appendChild(a); scrollChatToBottom();
 
   apiPost('/api/chat', {query:query, paper_ids:chatPaperIds, source:chatSource, history:chatHistory.slice(-20)}, (err, data)=>{
-    if(err){ a.innerHTML = '<div class="chat-label">Assistant</div><div class="chat-bubble" style="color:var(--red);">Error: '+esc(err.message)+'</div>'; scrollChatToBottom(); return; }
+    if(err){ a.innerHTML = '<div class="chat-label">Assistant</div><div class="chat-bubble" style="color:var(--red);">Error: '+esc(err.message)+'</div>'; scrollChatToMessage(a); return; }
     const resp = data.response||{}, content = resp.content || resp.reasoning || 'No response from AI.';
     const used = data.papers_used||[];
     let rendered = renderMarkdown(content);
@@ -1194,7 +1194,7 @@ function sendChat(){
       used.forEach((p,i)=>{ h += '<div class="rl"><b>['+(i+1)+']</b><a href="#" onclick="openReaderById(\''+esc(p.id||'')+'\');return false;">'+esc(p.title||'Untitled')+'</a></div>'; });
       h += '</div>';
     }
-    a.innerHTML = h; scrollChatToBottom();
+    a.innerHTML = h; scrollChatToMessage(a);
     chatHistory.push({role:'user',content:query}, {role:'assistant',content:content});
   });
 }
@@ -1202,6 +1202,13 @@ function clearChat(){ chatHistory = []; $('#chatLog').innerHTML = ''; }
 function scrollChatToBottom(){
   const log = $('#chatLog');
   if(log) log.scrollTop = log.scrollHeight;
+}
+function scrollChatToMessage(el){
+  // Align the TOP of a reply with the top of the log, so long answers are read
+  // from the start; scrollChatToBottom() landed the user at the reply's end.
+  const log = $('#chatLog');
+  if(!log || !el) return;
+  log.scrollTop += el.getBoundingClientRect().top - log.getBoundingClientRect().top - 6;
 }
 
 // ════════════════════ CHAT SOURCE SELECTION ════════════════════
