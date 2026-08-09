@@ -6,12 +6,15 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
+# Copy application code. config.json is deliberately NOT copied: it is
+# gitignored (holds API keys), so it does not exist in a CI checkout and the
+# COPY made every CI docker build fail. Keys come from the environment
+# (OPENROUTER_API_KEY / GEMINI_API_KEY) or a volume-mounted config.json.
 COPY server.py .
 COPY scraper.py .
 COPY enrichment.py .
+COPY build_paper_graph.py .
 COPY prompts.json .
-COPY config.json .
 COPY grey_sources/ grey_sources/
 COPY data/ data/
 COPY index.html .
