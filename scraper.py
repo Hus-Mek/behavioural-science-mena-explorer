@@ -1310,7 +1310,9 @@ if __name__ == "__main__":
 
     all_papers = scraper.dedup(all_papers)
     tag = args.tag or args.query or args.group or args.custom or "multi"
-    tag = re.sub(r'[^A-Za-z0-9_\-]+', '_', tag)[:80] or "multi"
+    # \w keeps Unicode letters (NTFS handles Arabic filenames fine); the old
+    # A-Za-z0-9 class collapsed every Arabic query to "papers___.json".
+    tag = re.sub(r'[^\w\-]+', '_', tag)[:80] or "multi"
     out = scraper.save(all_papers, tag)
     if out:
         print(f"\nSaved {len(all_papers)} unique papers to {out}")

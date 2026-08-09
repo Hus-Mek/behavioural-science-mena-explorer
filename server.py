@@ -74,6 +74,15 @@ LOG_DIR = ROOT / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / "server.log"
 
+# The console on Windows defaults to cp1252, so the StreamHandler raised
+# UnicodeEncodeError on every log line containing an Arabic query (the file
+# handler was already UTF-8). Same fix scraper.py applies to its own stdout.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -2065,19 +2074,40 @@ def analyze_papers(papers):
     }
     return results
 
+# Tashkeel (harakat), dagger alif, and tatweel: presentation marks that make the
+# same Arabic word compare unequal byte-for-byte.
+_ARABIC_NOISE = re.compile(r'[ً-ْٰـ]')
+# Any letter in the Arabic blocks (base + supplement + extended-A).
+_ARABIC_CHARS = re.compile(r'[؀-ۿݐ-ݿࢠ-ࣿ]')
+# Unicode-aware word: letters only, 2+ chars. \w alone would admit digits/underscore.
+_SEARCH_WORD = re.compile(r'[^\W\d_]{2,}')
+
+def _normalize_arabic(text):
+    """Fold the Arabic orthographic variants users type interchangeably."""
+    text = _ARABIC_NOISE.sub('', text)
+    return (text.replace('أ', 'ا').replace('إ', 'ا').replace('آ', 'ا')
+                .replace('ة', 'ه').replace('ى', 'ي'))
+
 def search_papers(papers, query, fields=None):
     if fields is None:
         fields = ["title", "summary", "authors"]
-    ql = query.lower()
-    import re as _re
-    query_words = set(_re.findall(r'\b[a-zA-Z]{2,}\b', ql))
-    exact_phrase = ql
+    ql = _normalize_arabic(query.lower()).strip()
+    # \b[a-zA-Z]\b tokenising meant an Arabic query produced ZERO query words and
+    # scored nothing; and bare substring matching let "art" hit "particle".
+    query_words = set(_SEARCH_WORD.findall(ql))
+    phrase_re = re.compile(r'(?<!\w)' + re.escape(ql) + r'(?!\w)') if ql else None
+    # One shared word was enough to include a paper, so "nudge theory in
+    # healthcare" returned every abstract containing "theory" (~1500 of 1700).
+    # Require at least half the query words before a keyword match counts.
+    required_overlap = max(1, (len(query_words) + 1) // 2)
     keyword_scores = {}
     for p in papers:
-        text = " ".join(str(p.get(f, "") or "") for f in fields).lower()
-        score = 2 if exact_phrase in text else 0
-        word_overlap = sum(1 for w in query_words if w in text)
-        score += min(word_overlap, 3)
+        text = _normalize_arabic(" ".join(str(p.get(f, "") or "") for f in fields).lower())
+        score = 2 if (phrase_re and phrase_re.search(text)) else 0
+        text_words = set(_SEARCH_WORD.findall(text))
+        word_overlap = len(query_words & text_words)
+        if word_overlap >= required_overlap:
+            score += min(word_overlap, 3)
         score = min(score, 3)
         if score > 0:
             keyword_scores[p.get("id") or p.get("entry_id")] = score
@@ -2093,10 +2123,19 @@ def search_papers(papers, query, fields=None):
             query_norm = np.linalg.norm(query_vec)
             if query_norm > 0:
                 similarities = np.dot(emb_matrix, query_vec) / (norms * query_norm)
+                # `sim > 0` admitted the entire corpus: with these embeddings even
+                # an off-topic query scores ~0.5 cosine against every paper
+                # (measured: min 0.32, median 0.50 for "quantum computing" on a
+                # behavioural-science corpus), so every search returned ~1700
+                # "results". Absolute thresholds don't separate on- from off-topic
+                # here; the margin above the query's own corpus median does. Keep
+                # only papers at least halfway from the median to the best match.
+                med = float(np.median(similarities))
+                spread = max(float(similarities.max()) - med, 1e-6)
                 for idx, pid in enumerate(emb_ids):
-                    sim = float(similarities[idx])
-                    if sim > 0:
-                        embedding_scores[pid] = sim * 3.0
+                    rel = (float(similarities[idx]) - med) / spread
+                    if rel >= 0.5:
+                        embedding_scores[pid] = rel * 3.0
     combined = []
     for p in papers:
         pid = p.get("id") or p.get("entry_id")
@@ -2113,7 +2152,10 @@ def search_papers(papers, query, fields=None):
     if combined:
         combined.sort(key=lambda x: -x[0])
         return [p for _, p in combined]
-    # Fallback: pure substring matching
+    # Fallback: word-start prefix matching. Anchoring at a word boundary keeps
+    # partial typing working ("behav" finds "behaviour") without the mid-word
+    # false positives bare substring gave ("art" matched "particle").
+    prefix_re = re.compile(r'(?<!\w)' + re.escape(ql)) if ql else None
     results = []
     for p in papers:
         for field in fields:
@@ -2122,7 +2164,7 @@ def search_papers(papers, query, fields=None):
                 val = " ".join(val)
             if val is None:
                 val = ""
-            if ql in val.lower():
+            if prefix_re and prefix_re.search(_normalize_arabic(val.lower())):
                 d = dict(p)
                 d["_search_score"] = 1.0
                 results.append(d)
@@ -2133,6 +2175,11 @@ BEHAVIOURAL_QUERY_PREFIX = "behaviour OR behavior OR cognitive OR decision OR bi
 
 def _ensure_behavioural_query(query_key):
     if query_key in SCRAPER_QUERIES:
+        return query_key
+    # An Arabic query is already region-specific, and no source indexes papers
+    # containing BOTH Arabic script and these English terms — the AND wrap turned
+    # every Arabic scrape into a guaranteed zero-result run.
+    if _ARABIC_CHARS.search(query_key):
         return query_key
     return f"({BEHAVIOURAL_QUERY_PREFIX}) AND ({query_key})"
 
@@ -2157,11 +2204,17 @@ def run_scraper(query_key, count, sources=None, manage_flag=True):
         cmd = [sys.executable, "-u", "scraper.py", "-q", behavioural_query, "-n", str(count)]
         if sources:
             cmd.extend(["--sources", ",".join(sources)])
+        # encoding= is mandatory here: scraper.py reconfigures its stdout to UTF-8,
+        # but text=True alone decodes the pipe with the locale codec (cp1252 on
+        # Windows), which raises UnicodeDecodeError on bytes like 0x81 — i.e. the
+        # letter ف — killing the whole scrape for most Arabic queries.
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             cwd=str(ROOT),
             bufsize=1,
         )

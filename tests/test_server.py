@@ -471,5 +471,56 @@ class TestGreySourcesImport:
         assert callable(annas_archive_download)
 
 
+# ── Arabic search and query handling ─────────────────────────────────────────
+
+class TestArabicSearch:
+    def _papers(self, tmp_path):
+        data = [
+            {"id": "ar1", "title": "دراسة سلوك المستهلك في السعودية", "summary": "بحث ميداني"},
+            {"id": "en1", "title": "Consumer behaviour in Saudi Arabia", "summary": "A study of nudges"},
+            {"id": "en2", "title": "Particle physics overview", "summary": "Quarks and leptons"},
+        ]
+        return make_papers(tmp_path, data)
+
+    def test_arabic_single_word_matches(self, tmp_path):
+        papers = self._papers(tmp_path)
+        results = server.search_papers(papers, "سلوك")
+        assert any(p["id"] == "ar1" for p in results)
+
+    def test_arabic_words_score_without_exact_phrase(self, tmp_path):
+        """Words in a different order than the title — must match on word overlap."""
+        papers = self._papers(tmp_path)
+        results = server.search_papers(papers, "المستهلك سلوك")
+        assert any(p["id"] == "ar1" for p in results)
+
+    def test_arabic_taa_marbuta_normalised(self, tmp_path):
+        """دراسه (with ه) must match دراسة (with ة)."""
+        papers = self._papers(tmp_path)
+        results = server.search_papers(papers, "دراسه")
+        assert any(p["id"] == "ar1" for p in results)
+
+    def test_no_substring_false_positive(self, tmp_path):
+        """'art' must not match 'particle'."""
+        papers = self._papers(tmp_path)
+        results = server.search_papers(papers, "art")
+        assert all(p["id"] != "en2" for p in results)
+
+
+class TestEnsureBehaviouralQuery:
+    def test_known_key_passthrough(self):
+        key = next(iter(server.SCRAPER_QUERIES))
+        assert server._ensure_behavioural_query(key) == key
+
+    def test_english_custom_query_wrapped(self):
+        q = server._ensure_behavioural_query("water conservation")
+        assert q.endswith("AND (water conservation)")
+        assert "behaviour OR behavior" in q
+
+    def test_arabic_custom_query_not_wrapped(self):
+        """AND-ing 25 English terms onto an Arabic query guarantees zero results."""
+        q = server._ensure_behavioural_query("سلوك المستهلك")
+        assert q == "سلوك المستهلك"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
