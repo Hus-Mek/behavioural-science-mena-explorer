@@ -315,9 +315,13 @@ html[data-theme="light"] .topbar{background:oklch(0.97 0.008 275 / 0.97);}
 .paper-modal .pm-count b{color:var(--accent);}
 
 /* ── Papers Tab Multi-Select ─────────────────────────────── */
+/* Select mode: checkbox overlays the card's left gutter instead of stacking
+   as its own row above the title; the selected card gets an accent border. */
+.pcard.selectable{padding-left:50px;}
 .pcard.selectable .pcard-checkbox{display:flex;}
-.pcard .pcard-checkbox{display:none;align-items:center;justify-content:center;width:28px;height:28px;flex-shrink:0;margin-right:8px;}
-.pcard .pcard-checkbox input{accent-color:var(--accent);width:18px;height:18px;cursor:pointer;}
+.pcard .pcard-checkbox{display:none;position:absolute;top:16px;left:14px;width:24px;height:24px;align-items:center;justify-content:center;}
+.pcard .pcard-checkbox input{accent-color:var(--accent);width:17px;height:17px;cursor:pointer;}
+.pcard.selected{border-color:var(--accent);}
 .selection-toolbar{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);z-index:100;display:none;align-items:center;gap:12px;padding:12px 20px;background:var(--solid);border:1px solid var(--border-2);border-radius:12px;box-shadow:var(--shadow-lg);animation:slideUp .3s var(--ease);}
 @keyframes slideUp{from{transform:translateX(-50%) translateY(20px);opacity:0;}to{transform:translateX(-50%) translateY(0);opacity:1;}}
 .selection-toolbar .sel-count{font-size:12px;color:var(--text-2);}
@@ -573,7 +577,7 @@ html[data-theme="light"] .log{background:oklch(0.2 0.02 275 / 0.06);}
           <select class="fsel" id="pYear" onchange="doPSearch()"><option value="">All years</option></select>
           <select class="fsel" id="pConcept" onchange="doPSearch()"><option value="">All concepts</option></select>
           <select class="fsel" id="pGroup" onchange="doPSearch()"><option value="">Flat list</option><option value="year">Group by year</option><option value="concept">Group by concept</option></select>
-          <button class="btn-sec" id="papersMultiSelectBtn" onclick="togglePapersMultiSelect()"></button>
+          <button class="btn btn-sec" id="papersMultiSelectBtn" onclick="togglePapersMultiSelect()"></button>
         </div>
         <div id="pList"></div>
         <div class="pag" id="pPag"></div>
@@ -581,7 +585,7 @@ html[data-theme="light"] .log{background:oklch(0.2 0.02 275 / 0.06);}
 
       <!-- Selection Toolbar (appears when papers selected) -->
       <div class="selection-toolbar" id="selectionToolbar" style="display:none;">
-        <span class="sel-count"><b id="selectionCount">0</b> papers selected</span>
+        <span class="sel-count"><b id="selectionCount">0</b> <span id="selectionNoun">papers</span> selected</span>
         <button class="btn btn-sm" onclick="addSelectedPapersToChat()">Add to Chat Context</button>
         <button class="btn btn-ghost btn-sm" onclick="togglePapersMultiSelect()">Cancel</button>
       </div>
@@ -603,27 +607,6 @@ html[data-theme="light"] .log{background:oklch(0.2 0.02 275 / 0.06);}
           </div>
         </div>
         <div id="conceptsList"></div>
-      </section>
-
-      <!-- GRAPH -->
-      <section class="tab" id="t-graph">
-        <div class="panel">
-          <div class="eyebrow">Network</div>
-          <div class="sec-title">Paper Knowledge Graph</div>
-          <div class="sec-desc">Papers linked by shared keywords, by embedding similarity, or both. The semantic views need embeddings built first.</div>
-          <div class="fbar" style="margin-bottom:12px;">
-            <select class="fsel" id="graphType" onchange="switchGraphView()" style="min-width:160px;">
-              <option value="keyword">Keyword Co-occurrence</option>
-              <option value="embedding">Semantic (Embedding) Similarity</option>
-              <option value="merged">Merged (Both)</option>
-            </select>
-            <button class="btn btn-sec btn-sm" id="rebuildEmbedGraphBtn" onclick="rebuildEmbedGraph()" style="display:none;">Rebuild Embedding Graph</button>
-            <span id="graphStats" style="font-size:11px;color:var(--text-4);margin-left:auto;"></span>
-          </div>
-          <div style="height:72vh;border-radius:var(--r);border:1px solid var(--border);overflow:hidden;background:var(--solid);">
-            <iframe id="graphFrame" src="/paper_graph.html" style="width:100%;height:100%;border:none;" title="Paper graph"></iframe>
-          </div>
-        </div>
       </section>
 
       <!-- CHAT -->
@@ -708,7 +691,6 @@ html[data-theme="light"] .log{background:oklch(0.2 0.02 275 / 0.06);}
     <div class="sc-row"><span class="sc-key">g d</span><span>Dashboard</span></div>
     <div class="sc-row"><span class="sc-key">g p</span><span>Papers</span></div>
     <div class="sc-row"><span class="sc-key">g c</span><span>Concepts</span></div>
-    <div class="sc-row"><span class="sc-key">g g</span><span>Graph</span></div>
     <div class="sc-row"><span class="sc-key">g t</span><span>Chat</span></div>
     <div class="sc-row"><span class="sc-key">g b</span><span>Bookmarks</span></div>
     <div class="sc-row"><span class="sc-key">g o</span><span>Tools</span></div>
@@ -775,7 +757,6 @@ const IC = {
   dashboard:'<path d="M3 3h7v9H3zM14 3h7v5h-7zM14 12h7v9h-7zM3 16h7v5H3z"/>',
   papers:'<path d="M4 4h11l5 5v11a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z"/><path d="M14 4v5h5M8 13h8M8 17h6"/>',
   concepts:'<circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="7" r="2.5"/><circle cx="12" cy="17" r="2.5"/><path d="M8 7.5 10 15M16 9l-3 6.5"/>',
-  graph:'<circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="17" cy="17" r="2.5"/><path d="M8 16 16 8M9 18h6"/>',
   chat:'<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
   bookmarks:'<path d="m12 2 2.9 6.1 6.6.9-4.8 4.6 1.2 6.6L12 17.8 6.1 20.2l1.2-6.6L2.5 9l6.6-.9z"/>',
   tools:'<path d="M4 8h10M18 8h2M4 16h2M10 16h10"/><circle cx="16" cy="8" r="2.4"/><circle cx="8" cy="16" r="2.4"/>'
@@ -1030,13 +1011,9 @@ function renderPapersFlat(){
   page.forEach(p=>{
     const idx = PAPERS.indexOf(p);
     const d = (p.published||p.year||'').substring(0,10);
-    const isSelected = papersSelectedIds.includes(p.id);
-    const checkboxHtml = papersMultiSelectMode 
-      ? '<div class="pcard-checkbox"><input type="checkbox" ' + (isSelected ? 'checked' : '') + ' onchange="event.stopPropagation(); togglePaperSelection(\''+esc(p.id)+'\')"></div>'
-      : '';
-    const cardClass = papersMultiSelectMode ? 'pcard selectable' : 'pcard';
-    h += '<div class="'+cardClass+'" data-pid="'+esc(p.id)+'" tabindex="0" role="button" onclick="openReader('+idx+')" onkeydown="if(event.key===\'Enter\'){openReader('+idx+')}">'
-      + checkboxHtml
+    const c = pcardShell(p, idx);
+    h += '<div class="'+c.cls+'" data-pid="'+esc(p.id)+'" tabindex="0" role="button" onclick="'+c.action+'" onkeydown="if(event.key===\'Enter\'){'+c.action+'}">'
+      + c.checkbox
       + '<div class="ptitle"><span class="tx">'+escH(p.title,q)+'</span>'
       + '<span class="star'+(isBookmarked(p.id)?' on':'')+'" onclick="event.stopPropagation();toggleBookmark(\''+esc(p.id)+'\')">★</span></div>';
     if((p.authors||[]).length) h += '<div class="pauth">'+esc((p.authors||[]).join(', '))+'</div>';
@@ -1048,6 +1025,21 @@ function renderPapersFlat(){
   });
   el.innerHTML = h;
   renderPag(curFiltered.length, CON_PAGE, 'pPag', n=>{ curPage=n; renderPapersFlat(); window.scrollTo({top:0,behavior:'smooth'}); });
+}
+// Shared card shell for both renderers. In select mode the WHOLE card toggles
+// selection (clicking a card to select is the point of the mode); outside it,
+// the card opens the reader as before.
+function pcardShell(p, idx){
+  const isSelected = papersSelectedIds.includes(p.id);
+  const action = papersMultiSelectMode
+    ? 'togglePaperSelection(\''+esc(p.id)+'\')'
+    : 'openReader('+idx+')';
+  const cls = 'pcard' + (papersMultiSelectMode ? ' selectable' : '') + (isSelected ? ' selected' : '');
+  const checkbox = papersMultiSelectMode
+    ? '<div class="pcard-checkbox"><input type="checkbox" '+(isSelected?'checked ':'')
+      + 'onclick="event.stopPropagation()" onchange="togglePaperSelection(\''+esc(p.id)+'\')"></div>'
+    : '';
+  return {cls: cls, action: action, checkbox: checkbox};
 }
 function renderPGrouped(type){
   const groups = {};
@@ -1067,13 +1059,9 @@ function renderPGrouped(type){
       + '<h3>'+esc(name)+'</h3><span class="cnt">'+list.length+' paper'+(list.length!==1?'s':'')+'</span></div><div class="grp-body">';
     list.forEach(p=>{
       const idx = PAPERS.indexOf(p);
-      const isSelected = papersSelectedIds.includes(p.id);
-      const checkboxHtml = papersMultiSelectMode 
-        ? '<div class="pcard-checkbox"><input type="checkbox" ' + (isSelected ? 'checked' : '') + ' onchange="event.stopPropagation(); togglePaperSelection(\''+esc(p.id)+'\')"></div>'
-        : '';
-      const cardClass = papersMultiSelectMode ? 'pcard selectable' : 'pcard';
-      h += '<div class="'+cardClass+'" data-pid="'+esc(p.id)+'" tabindex="0" role="button" onclick="openReader('+idx+')" onkeydown="if(event.key===\'Enter\'){openReader('+idx+')}">'
-        + checkboxHtml
+      const c = pcardShell(p, idx);
+      h += '<div class="'+c.cls+'" data-pid="'+esc(p.id)+'" tabindex="0" role="button" onclick="'+c.action+'" onkeydown="if(event.key===\'Enter\'){'+c.action+'}">'
+        + c.checkbox
         + '<div class="ptitle"><span class="tx">'+esc(p.title)+'</span>'
         + '<span class="star'+(isBookmarked(p.id)?' on':'')+'" onclick="event.stopPropagation();toggleBookmark(\''+esc(p.id)+'\')">★</span></div>'
         + '<div class="pmeta"><span class="chip date">'+esc((p.published||p.year||'').substring(0,10))+'</span></div></div>';
@@ -1455,9 +1443,13 @@ function togglePaperSelection(pid){
     papersSelectedIds.push(pid);
   }
   updateSelectionToolbar();
-  // Update checkbox in card
-  const checkbox = document.querySelector(`.pcard[data-pid="${pid}"] .pcard-checkbox input`);
-  if(checkbox) checkbox.checked = idx === -1;
+  // Sync the card in place (no re-render): checkbox state + accent border
+  const card = document.querySelector(`.pcard[data-pid="${pid}"]`);
+  if(card){
+    card.classList.toggle('selected', idx === -1);
+    const checkbox = card.querySelector('.pcard-checkbox input');
+    if(checkbox) checkbox.checked = idx === -1;
+  }
 }
 
 function updateSelectionToolbar(){
@@ -1466,6 +1458,7 @@ function updateSelectionToolbar(){
   if(papersSelectedIds.length > 0){
     toolbar.style.display = 'flex';
     $('#selectionCount').textContent = papersSelectedIds.length;
+    $('#selectionNoun').textContent = papersSelectedIds.length === 1 ? 'paper' : 'papers';
   } else {
     toolbar.style.display = 'none';
   }
@@ -1816,48 +1809,9 @@ function clearAndRebuild(){
 // leaving the panel stuck on "Checking…". renderTools() calls this itself now.
 
 // ════════════════════ EMBEDDING GRAPH ════════════════════
-function switchGraphView(){
-  const type = $('#graphType').value;
-  const frame = $('#graphFrame');
-  const btn = $('#rebuildEmbedGraphBtn');
-  const stats = $('#graphStats');
-
-  if(type === 'keyword'){
-    frame.src = '/paper_graph.html';
-    btn.style.display = 'none';
-    stats.textContent = '';
-    return;
-  }
-
-  btn.style.display = 'inline-flex';
-
-  const query = type === 'merged' ? '?merged=1' : '';
-  frame.src = '/embedding_graph.html' + query;
-  stats.textContent = 'Loading…';
-}
-
-function rebuildEmbedGraph(){
-  const btn = $('#rebuildEmbedGraphBtn');
-  const threshold = parseFloat($('#embedGraphThreshold').value) || 0.7;
-  btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span> Building…';
-  apiPost('/api/embedding_graph', {rebuild: true, threshold: threshold, merged: $('#graphType').value === 'merged'}, (err, data)=>{
-    btn.disabled = false;
-    btn.innerHTML = 'Rebuild Embedding Graph';
-    if(err || data.error){
-      toast('Graph build failed: '+(err?err.message:data.error), 'err');
-      $('#graphStats').textContent = 'Failed';
-      return;
-    }
-    toast('Graph built: '+(data.nodes?data.nodes.length:0)+' nodes, '+(data.edges?data.edges.length:0)+' edges', 'ok');
-    $('#graphStats').textContent = (data.nodes?data.nodes.length:0)+' nodes · '+(data.edges?data.edges.length:0)+' edges';
-    // Refresh the iframe
-    const frame = $('#graphFrame');
-    const type = $('#graphType').value;
-    frame.src = type === 'merged' ? '/embedding_graph.html?merged=1' : '/embedding_graph.html';
-  });
-}
-
+// The Graph tab is gone: its iframe loaded the vis-network physics simulation
+// eagerly on EVERY page load (even hidden), which froze the compositor. The
+// standalone graph pages stay reachable from the Tools section in a new tab.
 function buildEmbedGraphFromTools(){
   const btn = $('#buildEmbedGraphBtn');
   const threshold = parseFloat($('#embedGraphThreshold').value) || 0.65;
@@ -2004,7 +1958,9 @@ function renderTools(keyInfo){
   h += '<div class="tool-section"><h3>'+svg('<circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="17" cy="17" r="2.5"/><path d="M8 16 16 8M9 18h6"/>',2)+'Knowledge Graph (Embedding)</h3>'
     + '<div class="sec-desc">Build a semantic similarity graph from paper embeddings. Edges represent papers with cosine similarity > threshold.</div>'
     + '<div class="tool-row"><label>Threshold</label><input type="number" id="embedGraphThreshold" value="0.7" min="0.1" max="0.99" step="0.02" style="width:74px;">'
-    + '<button class="btn" id="buildEmbedGraphBtn" onclick="buildEmbedGraphFromTools()">Build Semantic Graph</button></div>'
+    + '<button class="btn" id="buildEmbedGraphBtn" onclick="buildEmbedGraphFromTools()">Build Semantic Graph</button>'
+    + '<a class="btn btn-sec btn-sm" href="/embedding_graph.html" target="_blank" rel="noopener">View semantic graph ↗</a>'
+    + '<a class="btn btn-sec btn-sm" href="/paper_graph.html" target="_blank" rel="noopener">View keyword graph ↗</a></div>'
     + '<div id="embedGraphStatus" style="font-size:11.5px;color:var(--text-4);margin-top:6px;"></div></div>';
 
   h += '<div class="tool-section"><h3>'+svg('<path d="M5 8h14M5 8a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v1a2 2 0 0 1-2 2M5 8v11a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8"/>',2)+'Arabic / MENA Papers</h3>'
@@ -2054,7 +2010,6 @@ const TABS = [
   {id:'dashboard', label:'Dashboard', sub:'Corpus overview & analytics', icon:'dashboard'},
   {id:'papers', label:'Papers', sub:'Browse & search the corpus', icon:'papers'},
   {id:'concepts', label:'Concepts', sub:'AI-powered theme clustering', icon:'concepts'},
-  {id:'graph', label:'Graph', sub:'Knowledge network', icon:'graph'},
   {id:'chat', label:'Chat', sub:'Ask the corpus anything', icon:'chat'},
   {id:'bookmarks', label:'Bookmarks', sub:'Your saved papers', icon:'bookmarks'},
   {id:'tools', label:'Tools', sub:'Scrape, analyse, export & configure', icon:'tools'}
@@ -2118,7 +2073,7 @@ document.addEventListener('keydown', e=>{
   const inField = ['INPUT','TEXTAREA','SELECT'].indexOf(e.target.tagName)!==-1;
   if(e.key==='/' && !inField){ e.preventDefault(); navTo('papers'); const s=$('#pSearch'); if(s){ s.focus(); s.select(); } return; }
   if(shortcutPrefix==='g' && e.key.length===1){
-    const map = {d:'dashboard',p:'papers',c:'concepts',g:'graph',t:'chat',b:'bookmarks',o:'tools'};
+    const map = {d:'dashboard',p:'papers',c:'concepts',t:'chat',b:'bookmarks',o:'tools'};
     if(map[e.key.toLowerCase()]){ e.preventDefault(); navTo(map[e.key.toLowerCase()]); }
     shortcutPrefix = false; return;
   }
