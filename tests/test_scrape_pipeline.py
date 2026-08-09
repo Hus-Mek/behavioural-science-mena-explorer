@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 os.environ.setdefault("OPENROUTER_API_KEY", "test-key-dummy")
 
 import server
+from app import embeddings as app_embeddings
 
 
 ARABIC_QUERY = "الاقتصاد السلوكي في السعودية"
@@ -131,9 +132,9 @@ def embedding_env(tmp_path):
     prev_matrix, prev_ids = server.embedding_snapshot()
     emb_cache = tmp_path / "embeddings.json"
     meta_cache = tmp_path / "embeddings_meta.json"
-    with patch.object(server, "EMBEDDING_CACHE", emb_cache), \
-         patch.object(server, "EMBEDDING_META_CACHE", meta_cache), \
-         patch.object(server, "PDF_DIR", tmp_path / "pdfs"):
+    with patch.object(app_embeddings, "EMBEDDING_CACHE", emb_cache), \
+         patch.object(app_embeddings, "EMBEDDING_META_CACHE", meta_cache), \
+         patch.object(app_embeddings, "PDF_DIR", tmp_path / "pdfs"):
         yield {"cache": emb_cache, "meta": meta_cache}
     server._set_embeddings(prev_matrix, prev_ids)
 
@@ -142,9 +143,9 @@ class TestEmbedNewPapers:
     def test_embeds_only_the_missing_paper(self, embedding_env):
         server._set_embeddings(np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
                                ["p1", "p2"])
-        with patch.object(server, "EMBEDDING_PROVIDER", "gemini"), \
-             patch.object(server, "get_gemini_api_key", return_value="key"), \
-             patch.object(server, "_get_embedding_batch_gemini",
+        with patch.object(app_embeddings, "EMBEDDING_PROVIDER", "gemini"), \
+             patch.object(app_embeddings, "get_gemini_api_key", return_value="key"), \
+             patch.object(app_embeddings, "_get_embedding_batch_gemini",
                           return_value=[[0.0, 0.0, 1.0]]) as mock_batch:
             count = server.embed_new_papers(PAPERS)
 
@@ -170,9 +171,9 @@ class TestEmbedNewPapers:
     def test_no_api_key_returns_zero_and_changes_nothing(self, embedding_env):
         server._set_embeddings(np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
                                ["p1", "p2"])
-        with patch.object(server, "EMBEDDING_PROVIDER", "gemini"), \
-             patch.object(server, "get_gemini_api_key", return_value=""), \
-             patch.object(server, "_get_embedding_batch_gemini",
+        with patch.object(app_embeddings, "EMBEDDING_PROVIDER", "gemini"), \
+             patch.object(app_embeddings, "get_gemini_api_key", return_value=""), \
+             patch.object(app_embeddings, "_get_embedding_batch_gemini",
                           MagicMock()) as mock_batch:
             count = server.embed_new_papers(PAPERS)
 
@@ -186,9 +187,9 @@ class TestEmbedNewPapers:
 
     def test_nothing_new_returns_zero_without_calling_provider(self, embedding_env):
         server._set_embeddings(np.eye(3), ["p1", "p2", "p3"])
-        with patch.object(server, "EMBEDDING_PROVIDER", "gemini"), \
-             patch.object(server, "get_gemini_api_key", return_value="key"), \
-             patch.object(server, "_get_embedding_batch_gemini",
+        with patch.object(app_embeddings, "EMBEDDING_PROVIDER", "gemini"), \
+             patch.object(app_embeddings, "get_gemini_api_key", return_value="key"), \
+             patch.object(app_embeddings, "_get_embedding_batch_gemini",
                           MagicMock()) as mock_batch:
             count = server.embed_new_papers(PAPERS)
         assert count == 0
@@ -198,9 +199,9 @@ class TestEmbedNewPapers:
     def test_bootstraps_when_no_matrix_exists(self, embedding_env):
         server._set_embeddings(None, [])
         vectors = [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]
-        with patch.object(server, "EMBEDDING_PROVIDER", "gemini"), \
-             patch.object(server, "get_gemini_api_key", return_value="key"), \
-             patch.object(server, "_get_embedding_batch_gemini",
+        with patch.object(app_embeddings, "EMBEDDING_PROVIDER", "gemini"), \
+             patch.object(app_embeddings, "get_gemini_api_key", return_value="key"), \
+             patch.object(app_embeddings, "_get_embedding_batch_gemini",
                           return_value=vectors):
             count = server.embed_new_papers(PAPERS)
         assert count == 3
@@ -210,11 +211,11 @@ class TestEmbedNewPapers:
 
     def test_batch_failure_falls_back_to_single_requests(self, embedding_env):
         server._set_embeddings(np.array([[1.0, 0.0], [0.0, 1.0]]), ["p1", "p2"])
-        with patch.object(server, "EMBEDDING_PROVIDER", "gemini"), \
-             patch.object(server, "get_gemini_api_key", return_value="key"), \
-             patch.object(server, "_get_embedding_batch_gemini",
+        with patch.object(app_embeddings, "EMBEDDING_PROVIDER", "gemini"), \
+             patch.object(app_embeddings, "get_gemini_api_key", return_value="key"), \
+             patch.object(app_embeddings, "_get_embedding_batch_gemini",
                           return_value=None), \
-             patch.object(server, "_get_embedding_gemini",
+             patch.object(app_embeddings, "_get_embedding_gemini",
                           return_value=[0.5, 0.5]) as mock_single:
             count = server.embed_new_papers(PAPERS)
         assert count == 1
@@ -228,9 +229,9 @@ class TestEmbedNewPapers:
         # every cosine score, so the delta path must refuse.
         server._set_embeddings(np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
                                ["p1", "p2"])
-        with patch.object(server, "EMBEDDING_PROVIDER", "gemini"), \
-             patch.object(server, "get_gemini_api_key", return_value="key"), \
-             patch.object(server, "_get_embedding_batch_gemini",
+        with patch.object(app_embeddings, "EMBEDDING_PROVIDER", "gemini"), \
+             patch.object(app_embeddings, "get_gemini_api_key", return_value="key"), \
+             patch.object(app_embeddings, "_get_embedding_batch_gemini",
                           return_value=[[1.0, 2.0]]):
             count = server.embed_new_papers(PAPERS)
         assert count == 0
@@ -241,9 +242,9 @@ class TestEmbedNewPapers:
 
     def test_openai_provider_uses_single_requests(self, embedding_env):
         server._set_embeddings(np.array([[1.0, 0.0], [0.0, 1.0]]), ["p1", "p2"])
-        with patch.object(server, "EMBEDDING_PROVIDER", "openai"), \
-             patch.object(server, "get_api_key", return_value="key"), \
-             patch.object(server, "_get_embedding_openai",
+        with patch.object(app_embeddings, "EMBEDDING_PROVIDER", "openai"), \
+             patch.object(app_embeddings, "get_api_key", return_value="key"), \
+             patch.object(app_embeddings, "_get_embedding_openai",
                           return_value=[0.7, 0.7]) as mock_openai:
             count = server.embed_new_papers(PAPERS)
         assert count == 1

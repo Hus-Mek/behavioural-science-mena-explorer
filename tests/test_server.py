@@ -16,6 +16,7 @@ os.environ["OPENROUTER_API_KEY"] = "test-key-dummy"
 
 import server
 import scraper
+from app import config as app_config
 
 
 def make_papers(tmp_path, papers_data, filename="papers_test.json"):
@@ -174,19 +175,19 @@ class TestConfig:
     def test_load_config_file(self, tmp_path):
         cfg_file = tmp_path / "config.json"
         cfg_file.write_text(json.dumps({"openrouter_api_key": "test-key-123"}))
-        with patch.object(server, "CONFIG_FILE", cfg_file):
+        with patch.object(app_config, "CONFIG_FILE", cfg_file):
             cfg = server.load_config()
             assert cfg["openrouter_api_key"] == "test-key-123"
 
     def test_load_config_missing_file(self, tmp_path):
         cfg_file = tmp_path / "nonexistent.json"
-        with patch.object(server, "CONFIG_FILE", cfg_file):
+        with patch.object(app_config, "CONFIG_FILE", cfg_file):
             cfg = server.load_config()
             assert cfg == {}
 
     def test_save_config(self, tmp_path):
         cfg_file = tmp_path / "config.json"
-        with patch.object(server, "CONFIG_FILE", cfg_file):
+        with patch.object(app_config, "CONFIG_FILE", cfg_file):
             server.save_config({"key": "value"})
             loaded = json.loads(cfg_file.read_text())
             assert loaded["key"] == "value"
@@ -318,12 +319,29 @@ class TestBatchJobs:
             server.batch_jobs.clear()
             server.batch_job_counter = 0
 
-            handler.do_POST()
+            # Stub the summariser: the job thread otherwise calls the LIVE
+            # OpenRouter API with the dummy test key (observed as stray
+            # "HTTP 401 ... Trying fallback" lines after the pytest summary).
+            # Keep the patch active until the thread finishes so no call can
+            # escape after the with-block restores the real function.
+            import time as _time
+            with patch.object(server, "llm_summarise", return_value={"summary": "stub"}):
+                handler.do_POST()
 
-            assert len(sent) == 1
-            assert "job_id" in sent[0]
-            assert sent[0]["status"] == "running"
-            assert sent[0]["total"] == 3
+                assert len(sent) == 1
+                assert "job_id" in sent[0]
+                assert sent[0]["status"] == "running"
+                assert sent[0]["total"] == 3
+
+                job_id = sent[0]["job_id"]
+                deadline = _time.time() + 10
+                while _time.time() < deadline:
+                    with server.batch_jobs_lock:
+                        if server.batch_jobs[job_id]["status"] == "done":
+                            break
+                    _time.sleep(0.05)
+                with server.batch_jobs_lock:
+                    assert server.batch_jobs[job_id]["status"] == "done"
         finally:
             del server.papers_global
 
