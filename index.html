@@ -844,7 +844,7 @@ function renderBookmarks(){
   b.forEach(pid=>{
     const p = PAPERS.find(x=>String(x.id)===String(pid)); if(!p) return;
     h += '<div class="pcard" onclick="openReaderById(\''+esc(p.id)+'\')">'
-      + '<div class="ptitle"><span class="tx">'+esc(p.title)+'</span>'
+      + '<div class="ptitle"><span class="tx" dir="auto">'+esc(p.title)+'</span>'
       + '<span class="star on" onclick="event.stopPropagation();toggleBookmark(\''+esc(p.id)+'\')">★</span></div>'
       + '<div class="pmeta"><span class="chip date">'+esc((p.published||p.year||'').substring(0,10))+'</span></div></div>';
   });
@@ -1014,10 +1014,10 @@ function renderPapersFlat(){
     const c = pcardShell(p, idx);
     h += '<div class="'+c.cls+'" data-pid="'+esc(p.id)+'" tabindex="0" role="button" onclick="'+c.action+'" onkeydown="if(event.key===\'Enter\'){'+c.action+'}">'
       + c.checkbox
-      + '<div class="ptitle"><span class="tx">'+escH(p.title,q)+'</span>'
+      + '<div class="ptitle"><span class="tx" dir="auto">'+escH(p.title,q)+'</span>'
       + '<span class="star'+(isBookmarked(p.id)?' on':'')+'" onclick="event.stopPropagation();toggleBookmark(\''+esc(p.id)+'\')">★</span></div>';
-    if((p.authors||[]).length) h += '<div class="pauth">'+esc((p.authors||[]).join(', '))+'</div>';
-    if(p.summary) h += '<div class="pabs">'+escH((p.summary||'').substring(0,220),q)+'</div>';
+    if((p.authors||[]).length) h += '<div class="pauth" dir="auto">'+esc((p.authors||[]).join(', '))+'</div>';
+    if(p.summary) h += '<div class="pabs" dir="auto">'+escH((p.summary||'').substring(0,220),q)+'</div>';
     h += '<div class="pmeta">';
     if(d) h += '<span class="chip date">'+d+'</span>';
     (p.tags||[]).slice(0,3).forEach(t=>{ h += '<span class="chip tagc">'+esc(t)+'</span>'; });
@@ -1062,7 +1062,7 @@ function renderPGrouped(type){
       const c = pcardShell(p, idx);
       h += '<div class="'+c.cls+'" data-pid="'+esc(p.id)+'" tabindex="0" role="button" onclick="'+c.action+'" onkeydown="if(event.key===\'Enter\'){'+c.action+'}">'
         + c.checkbox
-        + '<div class="ptitle"><span class="tx">'+esc(p.title)+'</span>'
+        + '<div class="ptitle"><span class="tx" dir="auto">'+esc(p.title)+'</span>'
         + '<span class="star'+(isBookmarked(p.id)?' on':'')+'" onclick="event.stopPropagation();toggleBookmark(\''+esc(p.id)+'\')">★</span></div>'
         + '<div class="pmeta"><span class="chip date">'+esc((p.published||p.year||'').substring(0,10))+'</span></div></div>';
     });
@@ -1159,7 +1159,7 @@ function sendChat(){
   input.value = '';
   const log = $('#chatLog');
   const u = document.createElement('div'); u.className='chat-msg user';
-  u.innerHTML = '<div class="chat-label">You</div><div class="chat-bubble">'+esc(query)+'</div>';
+  u.innerHTML = '<div class="chat-label">You</div><div class="chat-bubble" dir="auto">'+esc(query)+'</div>';
   log.appendChild(u);
   const a = document.createElement('div'); a.className='chat-msg ai';
   a.innerHTML = '<div class="chat-label">Assistant</div><div class="chat-bubble" style="color:var(--text-4);"><span class="spinner"></span>Searching the corpus…</div>';
@@ -1179,7 +1179,7 @@ function sendChat(){
       }
       return m;
     });
-    let h = '<div class="chat-label">Assistant</div><div class="chat-bubble">'+rendered+'</div>';
+    let h = '<div class="chat-label">Assistant</div><div class="chat-bubble" dir="auto">'+rendered+'</div>';
     if(used.length){
       h += '<div class="chat-refs"><div class="rh">References</div>';
       used.forEach((p,i)=>{ h += '<div class="rl"><b>['+(i+1)+']</b><a href="#" onclick="openReaderById(\''+esc(p.id||'')+'\');return false;">'+esc(p.title||'Untitled')+'</a></div>'; });
@@ -1355,7 +1355,7 @@ function renderPaperModalList(){
     const year = (p.published||p.year||'').substring(0,4);
     h += `<div class="pm-item" onclick="togglePaperModalItem('${esc(p.id)}', event)">
       <input type="checkbox" ${checked} onchange="event.stopPropagation(); togglePaperModalItem('${esc(p.id)}')">
-      <span class="pm-title" title="${esc(p.title)}">${esc(p.title)}</span>
+      <span class="pm-title" dir="auto" title="${esc(p.title)}">${esc(p.title)}</span>
       <span class="pm-meta">${esc((p.authors||[]).slice(0,2).join(', '))}${(p.authors||[]).length > 2 ? ' et al.' : ''} • ${esc(year)}</span>
     </div>`;
   });
@@ -1504,10 +1504,10 @@ function renderReader(){
   $('#rNav').textContent = (readerIdx+1)+' / '+readerList.length;
   const pdf = p.pdf_url || p.url || '';
   $('#rPdf').dataset.url = pdf; $('#rPdf').style.display = pdf?'inline-flex':'none';
-  let h = '<div class="reader-title">'+esc(p.title)+'</div>';
-  if((p.authors||[]).length) h += '<div class="reader-auth">'+esc((p.authors||[]).join(', '))+'</div>';
+  let h = '<div class="reader-title" dir="auto">'+esc(p.title)+'</div>';
+  if((p.authors||[]).length) h += '<div class="reader-auth" dir="auto">'+esc((p.authors||[]).join(', '))+'</div>';
   if(p.published||p.year) h += '<div class="reader-date">'+esc(p.published||p.year||'')+'</div>';
-  h += '<div class="reader-abs"><h2>Abstract</h2>'+esc(p.summary||'No abstract available.')+'</div>';
+  h += '<div class="reader-abs" dir="auto"><h2>Abstract</h2>'+esc(p.summary||'No abstract available.')+'</div>';
   h += '<div class="reader-actions">'
     + '<button class="btn" onclick="summarisePaper()">'+svg('<path d="M12 3v3m0 12v3M5.6 5.6l2.1 2.1m8.6 8.6 2.1 2.1M3 12h3m12 0h3M5.6 18.4l2.1-2.1m8.6-8.6 2.1-2.1"/><circle cx="12" cy="12" r="3"/>',1.8)+'Summarise with AI</button>'
     + '<button class="btn btn-sec" onclick="toggleBookmark(\''+esc(p.id)+'\')">'+(isBookmarked(p.id)?'★ Bookmarked':'☆ Bookmark')+'</button>';
@@ -1728,9 +1728,9 @@ function runSemanticSearch(){
     if(!data.results || !data.results.length){ r.innerHTML = '<div style="color:var(--text-4);font-size:12.5px;">No results. Try building embeddings first.</div>'; return; }
     let h = '<div style="font-size:11.5px;color:var(--text-4);margin-bottom:10px;">'+data.count+' results for "'+esc(data.query)+'"</div>';
     data.results.forEach(x=>{
-      h += '<div class="pcard" onclick="openReaderById(\''+esc(x.id)+'\')"><div class="ptitle"><span class="tx">'+esc(x.title)+'</span></div>'
+      h += '<div class="pcard" onclick="openReaderById(\''+esc(x.id)+'\')"><div class="ptitle"><span class="tx" dir="auto">'+esc(x.title)+'</span></div>'
         + '<div class="pmeta"><span class="chip score">'+(x.score!=null?x.score.toFixed(3):'')+'</span></div>'
-        + '<div class="pabs" style="margin-top:8px;">'+esc(x.summary)+'</div></div>';
+        + '<div class="pabs" dir="auto" style="margin-top:8px;">'+esc(x.summary)+'</div></div>';
     });
     r.innerHTML = h;
   });
@@ -1844,9 +1844,9 @@ function findArabicPapers(){
     if(!data.results || !data.results.length){ r.innerHTML = '<div style="color:var(--text-4);font-size:12.5px;">No MENA papers with score ≥ '+min+'.</div>'; return; }
     let h = '<div style="font-size:11.5px;color:var(--text-4);margin-bottom:10px;">'+data.count+' papers with MENA relevance (score ≥ '+data.min_score+')</div>';
     data.results.forEach(x=>{
-      h += '<div class="pcard" onclick="openReaderById(\''+esc(x.id)+'\')"><div class="ptitle"><span class="tx">'+esc(x.title)+'</span></div>'
+      h += '<div class="pcard" onclick="openReaderById(\''+esc(x.id)+'\')"><div class="ptitle"><span class="tx" dir="auto">'+esc(x.title)+'</span></div>'
         + '<div class="pmeta"><span class="chip score">score '+x.score+'</span>'+ (x.details||[]).slice(0,4).map(d=>'<span class="chip tagc">'+esc(d)+'</span>').join('') +'</div>'
-        + '<div class="pabs" style="margin-top:8px;">'+esc(x.summary)+'</div></div>';
+        + '<div class="pabs" style="margin-top:8px;" dir="auto">'+esc(x.summary)+'</div></div>';
     });
     r.innerHTML = h;
   });
