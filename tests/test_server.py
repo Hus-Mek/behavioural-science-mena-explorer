@@ -506,6 +506,34 @@ class TestArabicSearch:
         assert all(p["id"] != "en2" for p in results)
 
 
+class TestCrossRefYear:
+    def test_plausible_published_print_wins(self):
+        item = {'published-print': {'date-parts': [[2021, 4, 1]]},
+                'created': {'date-parts': [[2020, 1, 1]]}}
+        assert scraper.crossref_year(item) == 2021
+
+    def test_garbage_year_falls_back_to_created(self):
+        """Live CrossRef case: publisher deposited 2121 for a 2021 paper."""
+        item = {'published-print': {'date-parts': [[2121, 4, 1]]},
+                'published-online': {'date-parts': [[2121, 4, 1]]},
+                'created': {'date-parts': [[2021, 4, 9]]}}
+        assert scraper.crossref_year(item) == 2021
+
+    def test_all_garbage_returns_none(self):
+        item = {'published-print': {'date-parts': [[2121]]},
+                'created': {'date-parts': [[3000]]}}
+        assert scraper.crossref_year(item) is None
+
+    def test_missing_dates_returns_none(self):
+        assert scraper.crossref_year({}) is None
+
+    def test_postdated_next_year_allowed(self):
+        from datetime import date as _date
+        nxt = _date.today().year + 1
+        item = {'published-print': {'date-parts': [[nxt]]}}
+        assert scraper.crossref_year(item) == nxt
+
+
 class TestEnsureBehaviouralQuery:
     def test_known_key_passthrough(self):
         key = next(iter(server.SCRAPER_QUERIES))

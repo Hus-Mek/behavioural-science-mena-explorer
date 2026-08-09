@@ -990,7 +990,10 @@ function initFilters(){
   ysel.length = 1; csel.length = 1; // reset, keep "All …"
   const years = {}, concepts = {};
   PAPERS.forEach(p=>{
-    const yr = (p.published||p.year||'').substring(0,4); if(yr) years[yr]=1;
+    // Only plausible years: CrossRef metadata has carried garbage like 2121,
+    // and a bare substring(0,4) also admits non-date strings.
+    const yr = (p.published||p.year||'').substring(0,4);
+    if(/^(19|20)\d\d$/.test(yr) && +yr <= new Date().getFullYear()+1) years[yr]=1;
     (p.tags||[]).forEach(t=>concepts[t]=1);
   });
   Object.keys(years).sort().reverse().forEach(y=>{ const o=document.createElement('option'); o.value=y;o.textContent=y;ysel.appendChild(o); });

@@ -175,6 +175,30 @@ def translate_query(query, src):
     return ' '.join(f'"{t}"' if ' ' in t else t for t in terms)
 
 
+def crossref_year(item, today=None):
+    """Pick a plausible publication year from a CrossRef work record.
+
+    Publisher-deposited dates contain outright garbage — live examples:
+    published-print [[2121]] on a 2021 paper, [[2117]] on a 2017 one — which
+    put years like 2121 in the Papers-tab year filter. CrossRef's 'created'
+    date is stamped by CrossRef itself at deposit time and is always sane, so
+    fall back to it whenever the publisher's year is implausible.
+    """
+    max_year = (today or date.today()).year + 1  # postdated issues are real
+    def first_year(field):
+        dp = item.get(field) or {}
+        dp = dp.get('date-parts') if isinstance(dp, dict) else None
+        if isinstance(dp, list) and dp and isinstance(dp[0], list) and dp[0]:
+            y = dp[0][0]
+            return y if isinstance(y, int) else None
+        return None
+    for field in ('published-print', 'published-online', 'created'):
+        y = first_year(field)
+        if y is not None and 1800 <= y <= max_year:
+            return y
+    return None
+
+
 try:
     from grey_sources import libgen_search, annas_archive_search
     HAS_GREY_SOURCES = True
@@ -576,7 +600,14 @@ class MultiSourceScraper:
                 year_el = article.find('.//Journal/JournalIssue/PubDate/Year')
                 if year_el is None:
                     year_el = article.find('.//ArticleDate/Year')
-                year = year_el.text if year_el is not None and year_el.text is not None else "2024"
+                year = year_el.text if year_el is not None and year_el.text is not None else None
+                if year is None:
+                    # Journals without a structured Year carry free text like
+                    # "2024 Jan-Feb" in MedlineDate. The old fallback fabricated
+                    # a hardcoded "2024" for these, planting wrong years in data.
+                    md = article.find('.//Journal/JournalIssue/PubDate/MedlineDate')
+                    m = re.search(r'\b(1[89]\d\d|20\d\d)\b', md.text or '') if md is not None else None
+                    year = m.group(1) if m else None
                 authors = []
                 for a in article.findall('.//Author'):
                     ln = a.find('LastName')
@@ -584,12 +615,15 @@ class MultiSourceScraper:
                     if ln is not None and ln.text is not None:
                         fn_text = fn.text if fn is not None and fn.text is not None else ""
                         authors.append(f"{ln.text} {fn_text}".strip())
-                papers.append({
+                paper = {
                     'id': f"PMID:{pmid}", 'title': title, 'authors': authors,
-                    'summary': summary, 'published': f"{year}-01-01",
+                    'summary': summary,
                     'pdf_url': f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
                     'source': 'PubMed', 'journal': journal
-                })
+                }
+                if year:
+                    paper['published'] = f"{year}-01-01"
+                papers.append(paper)
                 pbar.update(1)
         except (Timeout, ConnectionError, RequestException) as e:
             print(f"  PubMed request error: {e}")
@@ -738,19 +772,18 @@ class MultiSourceScraper:
                         authors.append(name)
                 abstract = item.get('abstract') or ""
                 abstract = re.sub(r'<[^>]+>', '', abstract)
-                pub_date = item.get('published-print', item.get('published-online', {}))
-                if not isinstance(pub_date, dict):
-                    pub_date = {}
-                date_parts = pub_date.get('date-parts', [[2024]])
-                year = date_parts[0][0] if date_parts and len(date_parts[0]) > 0 else 2024
+                year = crossref_year(item)
                 doi = item.get('DOI', '')
-                papers.append({
+                paper = {
                     'id': f"DOI:{doi}", 'title': title, 'authors': authors,
-                    'summary': abstract, 'published': f"{year}-01-01",
+                    'summary': abstract,
                     'pdf_url': f"https://doi.org/{doi}",
                     'source': 'CrossRef',
                     'journal': item.get('container-title', [''])[0] if item.get('container-title') else ''
-                })
+                }
+                if year is not None:
+                    paper['published'] = f"{year}-01-01"
+                papers.append(paper)
                 pbar.update(1)
         except (Timeout, ConnectionError, RequestException) as e:
             print(f"  CrossRef request error: {e}")
