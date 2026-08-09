@@ -412,10 +412,13 @@ class MultiSourceScraper:
         'annas': 'search_annas_archive',
     }
 
-    def __init__(self, delay=3):
+    def __init__(self, delay=3, sort_mode='relevance'):
         self.data_dir = Path("data/raw")
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.delay = delay
+        # 'relevance' (default) or 'recent'. Newest-first querying left the corpus
+        # 92% year-2026 papers, so relevance is the default for every caller.
+        self.sort_mode = sort_mode
         # CONTACT_EMAIL identifies this client to NCBI and CrossRef, both of which
         # ask for a real address and throttle anonymous clients hardest. Left unset
         # by default rather than hardcoding a personal address into a public repo --
@@ -496,7 +499,8 @@ class MultiSourceScraper:
             params = {
                 'search_query': query, 'start': start,
                 'max_results': min(100, max_results - len(papers)),
-                'sortBy': 'submittedDate', 'sortOrder': 'descending'
+                'sortBy': 'submittedDate' if self.sort_mode == 'recent' else 'relevance',
+                'sortOrder': 'descending'
             }
             try:
                 r = self.session.get("https://export.arxiv.org/api/query", params=params, timeout=30)
@@ -557,9 +561,14 @@ class MultiSourceScraper:
         papers = []
         pbar = self._pbar(min(max_results, 200), f"PubMed:{query[:20]}")
         try:
+            # esearch without 'sort' returns newest-first; 'relevance' asks for
+            # NCBI's Best Match ranking instead.
+            esearch_params = {'db': 'pubmed', 'retmode': 'json', 'retmax': max_results, 'term': query}
+            if self.sort_mode == 'relevance':
+                esearch_params['sort'] = 'relevance'
             r = self.session.get(
                 "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
-                params={'db': 'pubmed', 'retmode': 'json', 'retmax': max_results, 'term': query},
+                params=esearch_params,
                 timeout=30
             )
             r.raise_for_status()
@@ -640,7 +649,7 @@ class MultiSourceScraper:
                 params={
                     'db': 'pmc', 'retmode': 'json', 'retmax': max_results,
                     'term': query + ' AND "open access"[filter]',
-                    'sort': 'date'
+                    'sort': 'relevance' if self.sort_mode == 'relevance' else 'date'
                 },
                 timeout=30
             )
@@ -743,10 +752,15 @@ class MultiSourceScraper:
         papers = []
         pbar = self._pbar(min(max_results, 100), f"CrossRef:{query[:20]}")
         try:
+            # Without 'sort'/'order' CrossRef ranks by relevance score, which is
+            # exactly what relevance mode wants.
+            crossref_params = {'query': query, 'rows': min(max_results, 100),
+                               'filter': 'type:journal-article'}
+            if self.sort_mode == 'recent':
+                crossref_params.update({'sort': 'published', 'order': 'desc'})
             r = self.session.get(
                 "https://api.crossref.org/works",
-                params={'query': query, 'rows': min(max_results, 100), 'sort': 'published', 'order': 'desc',
-                        'filter': 'type:journal-article'},
+                params=crossref_params,
                 timeout=30
             )
             if r.status_code != 200:
@@ -795,18 +809,22 @@ class MultiSourceScraper:
         papers = []
         pbar = self._pbar(min(max_results, 200), f"OpenAlex:{query[:20]}")
         try:
+            openalex_params = {
+                'search': query,
+                'per-page': min(max_results, 200),
+                # No host_venue: OpenAlex removed it, and asking for an invalid
+                # select field 400s the whole request -- which is why this source
+                # silently returned zero papers on every scrape. Journal name now
+                # comes from primary_location.source, its documented replacement.
+                'select': 'id,doi,title,authorships,publication_year,publication_date,abstract_inverted_index,primary_location,locations,type,concepts'
+            }
+            # OpenAlex defaults to relevance_score:desc when 'search' is used and
+            # no 'sort' is sent, so relevance mode simply omits the param.
+            if self.sort_mode == 'recent':
+                openalex_params['sort'] = 'publication_date:desc'
             r = self.session.get(
                 "https://api.openalex.org/works",
-                params={
-                    'search': query,
-                    'per-page': min(max_results, 200),
-                    'sort': 'publication_date:desc',
-                    # No host_venue: OpenAlex removed it, and asking for an invalid
-                    # select field 400s the whole request -- which is why this source
-                    # silently returned zero papers on every scrape. Journal name now
-                    # comes from primary_location.source, its documented replacement.
-                    'select': 'id,doi,title,authorships,publication_year,publication_date,abstract_inverted_index,primary_location,locations,type,concepts'
-                },
+                params=openalex_params,
                 timeout=30
             )
             if r.status_code != 200:
@@ -1259,6 +1277,8 @@ if __name__ == "__main__":
                         help='Max results per source per query (12 sources by default)')
     parser.add_argument('--sources', default='arxiv,pubmed,pubmedcentral,semanticscholar,crossref,openalex,biorxiv,psyarxiv,osf,researchgate,libgen,annas',
                         help='Comma-separated sources (includes grey: libgen, annas)')
+    parser.add_argument('--sort', choices=['relevance', 'recent'], default='relevance',
+                        help='Source ranking: relevance (default) or recent (newest first)')
     parser.add_argument('--all-models', action='store_true', help='Run ALL behavioural model queries')
     parser.add_argument('--all-mena', action='store_true', help='Run ALL MENA queries')
     parser.add_argument('--all-combined', action='store_true', help='Run ALL combined queries')
@@ -1268,7 +1288,7 @@ if __name__ == "__main__":
                         help='Skip papers already in data/raw/ files')
     args = parser.parse_args()
 
-    scraper = MultiSourceScraper(delay=args.delay)
+    scraper = MultiSourceScraper(delay=args.delay, sort_mode=args.sort)
     sources = [s.strip() for s in args.sources.split(',') if s.strip()]
     all_papers = []
     selected_group = None
