@@ -461,6 +461,17 @@ def _get_embedding(text):
         return _get_embedding_gemini(text)
     return _get_embedding_openai(text)
 
+def _embedding_text(paper):
+    """Text to embed for one paper: cached PDF full text if present, else title+abstract."""
+    safe_id = re.sub(r'[^a-zA-Z0-9._-]', '_', str(paper.get("id") or paper.get("entry_id") or ""))
+    cache_path = PDF_DIR / f"{safe_id}.txt"
+    if cache_path.exists():
+        try:
+            return cache_path.read_text(encoding="utf-8")[:8000]
+        except Exception:
+            return ""
+    return (paper.get("title") or "") + " " + (paper.get("summary") or "")
+
 def build_embeddings(papers, provider=None, batch=True):
     # No `global` here: the pair is replaced only via _set_embeddings(), under the lock.
     import numpy as np
@@ -500,17 +511,7 @@ def build_embeddings(papers, provider=None, batch=True):
         texts = []
         id_map = []
         for p in papers:
-            safe_id = re.sub(r'[^a-zA-Z0-9._-]', '_', str(p.get("id") or p.get("entry_id") or ""))
-            cache_path = PDF_DIR / f"{safe_id}.txt"
-            if cache_path.exists():
-                try:
-                    full_text = cache_path.read_text(encoding="utf-8")[:8000]
-                except Exception:
-                    full_text = ""
-                text = full_text
-            else:
-                text = (p.get("title") or "") + " " + (p.get("summary") or "")
-            texts.append(text)
+            texts.append(_embedding_text(p))
             id_map.append(p.get("id") or p.get("entry_id"))
 
         # Process in batches of EMBEDDING_BATCH_SIZE
@@ -540,16 +541,7 @@ def build_embeddings(papers, provider=None, batch=True):
         for i, p in enumerate(papers):
             if fail_fast:
                 break
-            safe_id = re.sub(r'[^a-zA-Z0-9._-]', '_', str(p.get("id") or p.get("entry_id") or ""))
-            cache_path = PDF_DIR / f"{safe_id}.txt"
-            if cache_path.exists():
-                try:
-                    full_text = cache_path.read_text(encoding="utf-8")[:8000]
-                except Exception:
-                    full_text = ""
-                text = full_text
-            else:
-                text = (p.get("title") or "") + " " + (p.get("summary") or "")
+            text = _embedding_text(p)
             if provider == "gemini":
                 emb = _get_embedding_gemini(text)
             else:
@@ -577,6 +569,89 @@ def build_embeddings(papers, provider=None, batch=True):
         print(f"  Embeddings built: {len(ids)} papers (provider={provider})")
     else:
         print("  No embeddings were generated.")
+
+def embed_new_papers(papers):
+    """Embed only the papers that have no vector yet and append them to the matrix.
+
+    Delta counterpart to build_embeddings(): after a scrape, the handful of new
+    papers get vectors immediately instead of being invisible to semantic search
+    until a full manual rebuild. Returns the number of papers embedded. No API
+    key, nothing new, or a failed provider call all return 0 and leave the
+    in-memory matrix and on-disk caches untouched.
+    """
+    import numpy as np
+
+    provider = EMBEDDING_PROVIDER
+    # Same provider selection and key check as build_embeddings.
+    api_key = get_gemini_api_key() if provider == "gemini" else get_api_key()
+    if not api_key:
+        return 0
+
+    _load_embeddings()
+    matrix, ids = embedding_snapshot()
+    embedded_ids = set(ids or [])
+    new_papers = [p for p in papers
+                  if (p.get("id") or p.get("entry_id")) not in embedded_ids]
+    if not new_papers:
+        return 0
+
+    texts = [_embedding_text(p) for p in new_papers]
+    id_map = [p.get("id") or p.get("entry_id") for p in new_papers]
+
+    embeddings, new_ids = [], []
+    if provider == "gemini":
+        for batch_start in range(0, len(texts), EMBEDDING_BATCH_SIZE):
+            batch_texts = texts[batch_start:batch_start + EMBEDDING_BATCH_SIZE]
+            batch_ids = id_map[batch_start:batch_start + EMBEDDING_BATCH_SIZE]
+            results = _get_embedding_batch_gemini(batch_texts)
+            if results:
+                for emb, pid in zip(results, batch_ids):
+                    if emb:
+                        embeddings.append(emb)
+                        new_ids.append(pid)
+            else:
+                # Same fallback build_embeddings uses: retry the batch one by one.
+                for t, pid in zip(batch_texts, batch_ids):
+                    emb = _get_embedding_gemini(t)
+                    if emb:
+                        embeddings.append(emb)
+                        new_ids.append(pid)
+    else:
+        for t, pid in zip(texts, id_map):
+            emb = _get_embedding_openai(t)
+            if emb:
+                embeddings.append(emb)
+                new_ids.append(pid)
+
+    if not embeddings:
+        return 0
+
+    new_matrix = np.array(embeddings)
+    if matrix is not None and len(ids) > 0:
+        # A provider/model switch changes vector dimensions; appending mixed
+        # dimensions would corrupt every cosine score, so refuse and require a
+        # full rebuild instead.
+        if matrix.shape[1] != new_matrix.shape[1]:
+            print(f"  Skipping delta embed: dimension mismatch with existing matrix "
+                  f"({matrix.shape[1]} vs {new_matrix.shape[1]}); rebuild embeddings.")
+            return 0
+        combined_matrix = np.vstack([matrix, new_matrix])
+        # New list, never mutate the snapshot: row i must keep belonging to ids[i].
+        combined_ids = list(ids) + new_ids
+    else:
+        combined_matrix = new_matrix
+        combined_ids = list(new_ids)
+
+    _set_embeddings(combined_matrix, combined_ids)
+    # Persist exactly like build_embeddings: matrix cache, ids, then meta.
+    atomic_write_json(EMBEDDING_CACHE,
+                      {"embeddings": combined_matrix.tolist(), "ids": combined_ids})
+    atomic_write_json(EMBEDDING_META_CACHE, {
+        "provider": provider,
+        "model": EMBEDDING_MODEL_GEMINI if provider == "gemini" else EMBEDDING_MODEL_OPENAI,
+        "count": len(combined_ids),
+    })
+    return len(new_ids)
 
 def semantic_search(query, papers, top_k=15):
     import numpy as np
@@ -2254,6 +2329,17 @@ def run_scraper(query_key, count, sources=None, manage_flag=True):
             msg = f"\nDone. Total papers: {len(papers_global)}"
             scraper_status["output"] += msg
             log_scraper(msg.strip())
+            # Delta-embed before the relevance report below so the new papers'
+            # vectors are already in the matrix it scores against. Wrapped so a
+            # provider hiccup can never turn a successful scrape into a failure.
+            try:
+                embedded_count = embed_new_papers(papers_global)
+                if embedded_count:
+                    emb_msg = f"Embedded {embedded_count} new papers"
+                    scraper_status["output"] += "\n" + emb_msg
+                    log_scraper(emb_msg)
+            except Exception as e:
+                log_scraper(f"Auto-embed of new papers failed: {e}")
             try:
                 _load_embeddings()
                 _emb, _eids = embedding_snapshot()
@@ -2279,6 +2365,68 @@ def run_scraper(query_key, count, sources=None, manage_flag=True):
         scraper_status["running"] = False
 
 
+def _translate_query_to_english(query):
+    """One-shot LLM translation of an Arabic query into a short English academic
+    search query. Returns the English string, or None on any failure (no API
+    key, timeout, empty reply, reply still in Arabic).
+    """
+    prompt = (
+        "Translate this Arabic academic search query into a short English "
+        "academic search query (a few keywords, no boolean operators, no "
+        "quotes). Reply with ONLY the English query, nothing else.\n\n"
+        f"Arabic query: {query}"
+    )
+    try:
+        # max_tokens=2000: the reasoning model returns content=None when the
+        # token budget is too small, even for a one-line answer (see CLAUDE.md).
+        result = llm_call([{"role": "user", "content": prompt}],
+                          max_tokens=2000, temperature=0.0)
+    except Exception:
+        return None
+    if "error" in result:
+        return None
+    content = (result.get("content") or "").strip()
+    # Reasoning models sometimes wrap the answer in extra prose or quotes;
+    # keep only the first non-empty line.
+    lines = [ln.strip().strip('"\'') for ln in content.splitlines() if ln.strip()]
+    english = lines[0] if lines else ""
+    # A reply that still contains Arabic script (or rambles) is a failed
+    # translation, not a usable search query.
+    if not english or len(english) > 300 or _ARABIC_CHARS.search(english):
+        return None
+    return english
+
+
+def expand_queries(queries):
+    """Return a NEW queue: the input queries plus an English translation
+    appended for each Arabic-script query.
+
+    arXiv and PubMed index English only, so an Arabic query silently gets zero
+    results from them. Expanding — never replacing — keeps the Arabic query's
+    OpenAlex/CrossRef/SemanticScholar coverage AND adds English-index coverage.
+    Any translation failure is non-fatal: the Arabic query still runs on its
+    own. The input list is not mutated.
+    """
+    expanded = list(queries)
+    for q in queries:
+        if not _ARABIC_CHARS.search(q):
+            continue
+        english = _translate_query_to_english(q)
+        if not english:
+            note = f"Arabic query expansion skipped for: {q}"
+            scraper_status["output"] += note + "\n"
+            log_scraper(note)
+            continue
+        # Don't queue a translation that duplicates an existing query.
+        if any(english.casefold() == existing.casefold() for existing in expanded):
+            continue
+        note = f"Arabic query expanded: {q} -> {english}"
+        scraper_status["output"] += note + "\n"
+        log_scraper(note)
+        expanded.append(english)
+    return expanded
+
+
 def _run_scraper_queue(queries, count, sources=None):
     """Run query groups one at a time on a single worker thread.
 
@@ -2294,6 +2442,8 @@ def _run_scraper_queue(queries, count, sources=None):
     scraper_status["running"] = True
     scraper_status["output"] = ""
     scraper_status["returncode"] = None
+    # After the output reset, so the expansion notes survive in the status log.
+    queries = expand_queries(queries)
     failed = 0
     try:
         for i, q in enumerate(queries, 1):
