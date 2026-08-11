@@ -2624,7 +2624,11 @@ def serve(port=3000):
     # Bind loopback only. ("", port) binds 0.0.0.0, which exposed this server --
     # and every file it would serve, plus unauthenticated /api/shutdown and
     # LLM-spending endpoints -- to every host on the local network.
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    # MENA_HOST overrides the bind address for deliberate deployments only
+    # (e.g. a Tailscale interface IP). The default stays loopback for the
+    # reasons above.
+    host = os.environ.get("MENA_HOST", "127.0.0.1")
+    server = ThreadingHTTPServer((host, port), Handler)
     server.daemon_threads = True
     server.allow_reuse_address = True
 
