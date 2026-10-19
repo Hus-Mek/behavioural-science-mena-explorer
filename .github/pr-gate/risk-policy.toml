@@ -1,0 +1,33 @@
+# Risk policy for the PR gate. A PR's tier is the MAX of every rule it triggers.
+#   T0 docs/tests only   -> auto-merge when CI is green
+#   T1 small source      -> AI review, Claude may merge when the gate is green
+#   T2 big/deps/hotspot  -> human three-pass review, human merges
+#   T3 critical path     -> human review + time-delayed second pass, human merges
+# Patterns without "/" match the file name; patterns with "/" match the full path
+# ("*" crosses directories). This file is itself a critical path.
+
+[size]
+# Changed lines (added + deleted) in non-trivial files above which a PR is T2.
+max_t1_lines = 150
+
+[hotspot]
+# A file touched by at least this many fix/revert commits in the window is T2.
+window_days = 90
+min_fix_commits = 3
+
+[paths]
+trivial = [
+  "*.md", "*.rst", "*.txt", "docs/*", "*/docs/*",
+  "tests/*", "*/tests/*", "test_*.py", "*_test.py", "*.test.ts", "*.spec.ts",
+]
+dependency = [
+  "pyproject.toml", "requirements*.txt", "uv.lock", "poetry.lock",
+  "package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock",
+  "Cargo.toml", "Cargo.lock", "go.mod", "go.sum",
+]
+critical = [
+  ".github/*", "risk-policy.toml",
+  "auth/*", "*/auth/*", "*secret*", ".env*",
+  "migrations/*", "*/migrations/*", "*.sql",
+  "Dockerfile*", "docker-compose*.yml", "*.tf", "deploy/*", "*/deploy/*",
+]

@@ -1,0 +1,125 @@
+# Installed by Hus-Mek/pr-gate. Edit the source there, then re-run install.py.
+name: pr-gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-gate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  attribution:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check commits and PR body for AI attribution
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then range="origin/$BASE_REF..HEAD"
+          elif [ -z "$BEFORE" ] || [ "$BEFORE" = 0000000000000000000000000000000000000000 ]; then range="$GITHUB_SHA~1..$GITHUB_SHA"
+          else range="$BEFORE..$GITHUB_SHA"; fi
+          python3 .github/pr-gate/check_attribution.py --range "$range"
+
+  classify:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    outputs:
+      tier: ${{ steps.classify.outputs.tier }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Classify the merge commit against the base branch
+        id: classify
+        run: |
+          python3 .github/pr-gate/classify.py --base "origin/${{ github.base_ref }}" --head HEAD \
+            --markdown comment.md > result.json
+          cat result.json
+          echo "tier=$(jq -r .tier result.json)" >> "$GITHUB_OUTPUT"
+          echo "empty=$(jq -r .empty result.json)" >> "$GITHUB_OUTPUT"
+      - name: Label and comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          TIER: ${{ steps.classify.outputs.tier }}
+        run: |
+          for t in 0 1 2 3; do gh label create "risk:T$t" --color 5319e7 --force >/dev/null; done
+          gh pr edit "$PR" --remove-label risk:T0,risk:T1,risk:T2,risk:T3 >/dev/null || true
+          gh pr edit "$PR" --add-label "risk:T$TIER"
+          id=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
+            --jq '.[] | select(.body | startswith("<!-- pr-gate -->")) | .id' | head -1)
+          if [ -n "$id" ]; then gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -F body=@comment.md >/dev/null
+          else gh pr comment "$PR" --body-file comment.md; fi
+      - name: Fail on an empty merge
+        if: steps.classify.outputs.empty == 'true'
+        run: |
+          echo "::error::This PR changes nothing against ${{ github.base_ref }}; it is already merged. Close it."
+          exit 1
+
+  review:
+    needs: classify
+    if: needs.classify.outputs.tier != '0' && github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+    steps:
+      - name: Check for the review token
+        id: token
+        env:
+          TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then echo "present=true" >> "$GITHUB_OUTPUT"
+          else echo "::notice::CLAUDE_CODE_OAUTH_TOKEN is not set; skipping AI review"; fi
+      - uses: actions/checkout@v4
+        if: steps.token.outputs.present == 'true'
+        with:
+          fetch-depth: 1
+      - uses: anthropics/claude-code-action@5eb090f3c3afd701a0672cd32981197ca27688f6 # v1.0.253
+        if: steps.token.outputs.present == 'true'
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+            RISK TIER: T${{ needs.classify.outputs.tier }}
+
+            Review this pull request for correctness bugs and security problems only.
+
+            1. Read the diff with `gh pr diff`. List every candidate problem.
+            2. Verify each candidate by reading the surrounding code in the checkout. Drop it if you
+               cannot point to the exact input or state that breaks, if it already existed before
+               this PR, if a linter or type checker would catch it, or if it is style or naming.
+            3. Post each surviving finding as an inline comment with
+               `mcp__github_inline_comment__create_inline_comment` (confirmed: true), prefixed with a
+               Conventional Comments label: `issue (blocking):` or `suggestion (non-blocking):`.
+               Each comment states the failing input and the consequence in two sentences or fewer.
+            4. Finish with one top-level `gh pr comment` that starts with "pr-gate review:" and gives
+               the count of findings, or "pr-gate review: no confirmed issues" when none survived.
+
+            Silence beats noise: post nothing you have not verified. Do not approve or request changes.
+          claude_args: |
+            --max-turns 40
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Read,Grep,Glob"
