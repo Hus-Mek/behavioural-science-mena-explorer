@@ -31,7 +31,7 @@ jobs:
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then range="origin/$BASE_REF..HEAD"
           elif [ -z "$BEFORE" ] || [ "$BEFORE" = 0000000000000000000000000000000000000000 ]; then range="$GITHUB_SHA~1..$GITHUB_SHA"
           else range="$BEFORE..$GITHUB_SHA"; fi
-          python3 .github/pr-gate/check_attribution.py --range "$range"
+          python3 .github/pr-gate/check_attribution --range "$range"
 
   classify:
     if: github.event_name == 'pull_request'
@@ -50,7 +50,7 @@ jobs:
       - name: Classify the merge commit against the base branch
         id: classify
         run: |
-          python3 .github/pr-gate/classify.py --base "origin/${{ github.base_ref }}" --head HEAD \
+          python3 .github/pr-gate/classify --base "origin/${{ github.base_ref }}" --head HEAD \
             --markdown comment.md > result.json
           cat result.json
           echo "tier=$(jq -r .tier result.json)" >> "$GITHUB_OUTPUT"
