@@ -15,6 +15,13 @@ POLICY_PATH = Path(__file__).with_name("risk-policy.toml")
 RENAME_RE = re.compile(r"\{([^{}]*) => ([^{}]*)\}")
 FIX_SUBJECT_RE = r"^(fix|revert)"
 COMMENT_MARKER = "<!-- pr-gate -->"
+# Keys added after the first install. install.py never overwrites a target's own risk-policy.toml,
+# so a policy from an earlier install lacks them and takes these defaults.
+DEFAULT_MAX_LINES = 400
+DEFAULT_SIZE_EXCLUDED = (
+    "*.lock", "package-lock.json", "pnpm-lock.yaml", "go.sum",
+    "*.min.js", "*.min.css", "*.snap", "*.map",
+)
 TIER_ACTIONS = {
     0: "auto-merge when CI is green",
     1: "AI review; Claude may merge when the gate is green",
@@ -33,11 +40,13 @@ class Change:
 @dataclass(frozen=True)
 class Policy:
     max_t1_lines: int
+    max_lines: int
     window_days: int
     min_fix_commits: int
     trivial: tuple[str, ...]
     dependency: tuple[str, ...]
     critical: tuple[str, ...]
+    size_excluded: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -45,6 +54,8 @@ class Classification:
     tier: int
     reasons: tuple[str, ...]
     empty: bool = False
+    lines: int = 0
+    over_cap: bool = False
 
 
 def load_policy(path: Path) -> Policy:
@@ -52,11 +63,13 @@ def load_policy(path: Path) -> Policy:
     paths = raw["paths"]
     return Policy(
         max_t1_lines=raw["size"]["max_t1_lines"],
+        max_lines=raw["size"].get("max_lines", DEFAULT_MAX_LINES),
         window_days=raw["hotspot"]["window_days"],
         min_fix_commits=raw["hotspot"]["min_fix_commits"],
         trivial=tuple(paths["trivial"]),
         dependency=tuple(paths["dependency"]),
         critical=tuple(paths["critical"]),
+        size_excluded=tuple(paths.get("size_excluded", DEFAULT_SIZE_EXCLUDED)),
     )
 
 
@@ -79,13 +92,21 @@ def parse_numstat(raw: str) -> tuple[Change, ...]:
     return tuple(changes)
 
 
-def classify(changes: tuple[Change, ...], hotspots: frozenset[str], policy: Policy) -> Classification:
+def classify(
+    changes: tuple[Change, ...],
+    hotspots: frozenset[str],
+    policy: Policy,
+    generated: frozenset[str] = frozenset(),
+) -> Classification:
     if not changes:
         return Classification(0, ("empty diff: the merge would change nothing",), empty=True)
     source = [c for c in changes if not matches(c.path, policy.trivial)]
-    lines = sum(c.added + c.deleted for c in source)
+    lines = counted_lines(source, policy, generated)
+    over_cap = lines > policy.max_lines
     rules = (
         (2, lines > policy.max_t1_lines, f"{lines} changed lines exceed the T1 cap of {policy.max_t1_lines}"),
+        (2, over_cap, (f"{lines} changed lines exceed the hard cap of {policy.max_lines}; split the PR"
+                       " (the owner can add the size-exception label for a one-off)")),
         (2, _hits(changes, policy.dependency), "dependency manifest changed: "),
         (2, sorted(hotspots & {c.path for c in changes}), "hotspot file (repeated fixes): "),
         (3, _hits(changes, policy.critical), "critical path changed: "),
@@ -93,7 +114,14 @@ def classify(changes: tuple[Change, ...], hotspots: frozenset[str], policy: Poli
     fired = [(tier, _reason(text, hit)) for tier, hit, text in rules if hit]
     base = 1 if source else 0
     reasons = [r for _, r in fired] or [("source change within T1 limits" if base else "docs/tests only")]
-    return Classification(max([base, *(t for t, _ in fired)]), tuple(reasons))
+    tier = max([base, *(t for t, _ in fired)])
+    return Classification(tier, tuple(reasons), lines=lines, over_cap=over_cap)
+
+
+def counted_lines(source: list[Change], policy: Policy, generated: frozenset[str]) -> int:
+    """Review-effort lines: lockfiles, minified assets, and generated files do not count."""
+    kept = (c for c in source if c.path not in generated and not matches(c.path, policy.size_excluded))
+    return sum(c.added + c.deleted for c in kept)
 
 
 def _hits(changes: tuple[Change, ...], patterns: tuple[str, ...]) -> list[str]:
@@ -104,13 +132,28 @@ def _reason(text: str, hit: bool | list[str]) -> str:
     return text + ", ".join(hit) if isinstance(hit, list) else text
 
 
-def render_markdown(result: Classification) -> str:
+def render_markdown(result: Classification, policy: Policy = DEFAULT_POLICY) -> str:
     reasons = "\n".join(f"- {r}" for r in result.reasons)
-    return f"{COMMENT_MARKER}\n### pr-gate: **T{result.tier}**, {TIER_ACTIONS[result.tier]}\n\n{reasons}\n"
+    size = f"Size: {result.lines} counted lines (hard cap {policy.max_lines})"
+    return f"{COMMENT_MARKER}\n### pr-gate: **T{result.tier}**, {TIER_ACTIONS[result.tier]}\n\n{reasons}\n\n{size}\n"
 
 
 def git(*args: str) -> str:
     return subprocess.run(["git", *args], capture_output=True, text=True, encoding="utf-8", check=True).stdout
+
+
+def parse_check_attr(raw: str) -> frozenset[str]:
+    """Paths whose linguist-generated attribute is set, from `git check-attr` output."""
+    hits = (line.rsplit(": linguist-generated: ", 1) for line in raw.splitlines())
+    return frozenset(path for path, value in (h for h in hits if len(h) == 2) if value in ("set", "true"))
+
+
+def generated_files(paths: tuple[str, ...], source: str) -> frozenset[str]:
+    """Read attributes from `source` (the base), never the PR's own .gitattributes, so a PR
+    cannot mark its own files generated to dodge the size cap."""
+    if not paths:
+        return frozenset()
+    return parse_check_attr(git("check-attr", f"--source={source}", "linguist-generated", "--", *paths))
 
 
 def hotspot_files(base: str, policy: Policy) -> frozenset[str]:
@@ -130,13 +173,14 @@ def main() -> int:
     try:
         policy = load_policy(args.policy)
         changes = parse_numstat(git("diff", "--numstat", f"{args.base}...{args.head}"))
-        result = classify(changes, hotspot_files(args.base, policy), policy)
+        generated = generated_files(tuple(c.path for c in changes), args.base)
+        result = classify(changes, hotspot_files(args.base, policy), policy, generated)
     except (subprocess.CalledProcessError, OSError, KeyError, ValueError) as err:
         detail = getattr(err, "stderr", "") or err
         print(f"classify: cannot classify {args.base}...{args.head}: {detail}", file=sys.stderr)
         return 2
     if args.markdown:
-        args.markdown.write_text(render_markdown(result), encoding="utf-8")
+        args.markdown.write_text(render_markdown(result, policy), encoding="utf-8")
     print(json.dumps(asdict(result)))
     return 0
 

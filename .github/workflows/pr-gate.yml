@@ -22,6 +22,23 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Load gate scripts from the base branch
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          # Run the base branch's gate, never the PR's copy: a PR must not edit its own classifier.
+          # The PR copy is used only when the base has none yet (the install PR itself).
+          ref=HEAD
+          if [ -n "$BASE_REF" ]; then
+            if git rev-parse -q --verify "origin/$BASE_REF" >/dev/null; then ref="origin/$BASE_REF"
+            else git fetch -q --depth=1 origin "$BASE_REF" && ref=FETCH_HEAD; fi
+          fi
+          mkdir -p "$RUNNER_TEMP/gate"
+          for f in classify check_attribution agree review_loop risk-policy.toml; do
+            git show "$ref:.github/pr-gate/$f" > "$RUNNER_TEMP/gate/$f" 2>/dev/null \
+              || cp ".github/pr-gate/$f" "$RUNNER_TEMP/gate/$f" 2>/dev/null \
+              || rm -f "$RUNNER_TEMP/gate/$f"
+          done
       - name: Check commits and PR body for AI attribution
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
@@ -31,7 +48,7 @@ jobs:
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then range="origin/$BASE_REF..HEAD"
           elif [ -z "$BEFORE" ] || [ "$BEFORE" = 0000000000000000000000000000000000000000 ]; then range="$GITHUB_SHA~1..$GITHUB_SHA"
           else range="$BEFORE..$GITHUB_SHA"; fi
-          python3 .github/pr-gate/check_attribution --range "$range"
+          python3 "$RUNNER_TEMP/gate/check_attribution" --range "$range"
 
   classify:
     if: github.event_name == 'pull_request'
@@ -47,14 +64,35 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Load gate scripts from the base branch
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          # Run the base branch's gate, never the PR's copy: a PR must not edit its own classifier.
+          # The PR copy is used only when the base has none yet (the install PR itself).
+          ref=HEAD
+          if [ -n "$BASE_REF" ]; then
+            if git rev-parse -q --verify "origin/$BASE_REF" >/dev/null; then ref="origin/$BASE_REF"
+            else git fetch -q --depth=1 origin "$BASE_REF" && ref=FETCH_HEAD; fi
+          fi
+          mkdir -p "$RUNNER_TEMP/gate"
+          for f in classify check_attribution agree review_loop risk-policy.toml; do
+            git show "$ref:.github/pr-gate/$f" > "$RUNNER_TEMP/gate/$f" 2>/dev/null \
+              || cp ".github/pr-gate/$f" "$RUNNER_TEMP/gate/$f" 2>/dev/null \
+              || rm -f "$RUNNER_TEMP/gate/$f"
+          done
       - name: Classify the merge commit against the base branch
         id: classify
         run: |
-          python3 .github/pr-gate/classify --base "origin/${{ github.base_ref }}" --head HEAD \
+          python3 "$RUNNER_TEMP/gate/classify" --base "origin/${{ github.base_ref }}" --head HEAD \
             --markdown comment.md > result.json
           cat result.json
-          echo "tier=$(jq -r .tier result.json)" >> "$GITHUB_OUTPUT"
-          echo "empty=$(jq -r .empty result.json)" >> "$GITHUB_OUTPUT"
+          {
+            echo "tier=$(jq -r .tier result.json)"
+            echo "empty=$(jq -r .empty result.json)"
+            echo "over_cap=$(jq -r .over_cap result.json)"
+            echo "lines=$(jq -r .lines result.json)"
+          } >> "$GITHUB_OUTPUT"
       - name: Label and comment
         env:
           GH_TOKEN: ${{ github.token }}
@@ -73,16 +111,34 @@ jobs:
         run: |
           echo "::error::This PR changes nothing against ${{ github.base_ref }}; it is already merged. Close it."
           exit 1
+      - name: Fail over the size cap
+        if: steps.classify.outputs.over_cap == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          LINES: ${{ steps.classify.outputs.lines }}
+        run: |
+          # Read labels live, not from the event: a re-run reuses the original event payload.
+          if gh pr view "$PR" --json labels --jq '.labels[].name' | grep -qx size-exception; then
+            echo "::notice::$LINES counted lines exceed the hard cap, allowed by the owner's size-exception label."
+            exit 0
+          fi
+          echo "::error::$LINES counted lines exceed the 400-line hard cap. Split the PR, or the owner adds the size-exception label and re-runs this job."
+          exit 1
 
-  review:
+  # T3 only: two independent Opus passes that write findings instead of posting them.
+  review-pass:
     needs: classify
-    if: needs.classify.outputs.tier != '0' && github.event.pull_request.draft == false
+    if: needs.classify.outputs.tier == '3' && github.event.pull_request.draft == false
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        pass: [1, 2]
     permissions:
       contents: read
-      pull-requests: write
-      issues: write
+      pull-requests: read
       id-token: write
     steps:
       - name: Check for the review token
@@ -96,8 +152,93 @@ jobs:
         if: steps.token.outputs.present == 'true'
         with:
           fetch-depth: 1
+      - name: Remove any findings.json the PR itself carries
+        if: steps.token.outputs.present == 'true'
+        run: rm -f findings.json
       - uses: anthropics/claude-code-action@5eb090f3c3afd701a0672cd32981197ca27688f6 # v1.0.253
         if: steps.token.outputs.present == 'true'
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+            RISK TIER: T3 (independent review pass ${{ matrix.pass }} of 2)
+
+            Review this pull request for correctness bugs and security problems only.
+
+            1. Read the diff with `gh pr diff`. List every candidate problem.
+            2. Verify each candidate by reading the surrounding code in the checkout. Drop it if you
+               cannot point to the exact input or state that breaks, if it already existed before
+               this PR, if a linter or type checker would catch it, or if it is style or naming.
+            3. Do not post anything to GitHub. Write the surviving findings with the Write tool to
+               `findings.json` in the current working directory, as a JSON list of objects:
+               {"path": "<file path relative to the repo root>", "line": <line number in the new
+               version of the file, on a line the diff adds or changes>, "severity": "blocking" or
+               "non-blocking", "body": "<comment>"}.
+               Each body starts with a Conventional Comments label that matches the severity,
+               `issue (blocking):` or `suggestion (non-blocking):`, then states the failing input
+               and the consequence in two sentences or fewer.
+            4. Always write the file. When nothing survived, write `[]`.
+
+            Silence beats noise: include nothing you have not verified.
+          claude_args: |
+            --model claude-opus-5-5
+            --max-turns 60
+            --allowedTools "Bash(gh pr diff:*),Bash(gh pr view:*),Read,Grep,Glob,Write"
+      - name: Require findings.json
+        if: steps.token.outputs.present == 'true'
+        env:
+          PASS: ${{ matrix.pass }}
+        run: |
+          if [ ! -f findings.json ]; then
+            echo "::error::Review pass $PASS wrote no findings.json"; exit 1
+          fi
+          if ! jq -e 'type == "array"' findings.json > /dev/null; then
+            echo "::error::Review pass $PASS wrote a findings.json that is not a JSON list"
+            cat findings.json; exit 1
+          fi
+          echo "pass $PASS: $(jq length findings.json) findings"
+      - uses: actions/upload-artifact@v4
+        if: steps.token.outputs.present == 'true'
+        with:
+          name: findings-pass-${{ matrix.pass }}
+          path: findings.json
+          if-no-files-found: error
+          retention-days: 7
+
+  # The one check named `review` for every tier >= 1 (the local merge guard looks for it).
+  # T1/T2: a single pass that posts. T3: posts only what both review-pass runs agree on.
+  review:
+    needs: [classify, review-pass]
+    if: >-
+      !cancelled() && needs.classify.result == 'success' &&
+      needs.classify.outputs.tier != '0' && github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+    outputs:
+      blocking: ${{ steps.blocking.outputs.count || '0' }}
+    env:
+      TIER: ${{ needs.classify.outputs.tier }}
+    steps:
+      - name: Check for the review token
+        id: token
+        env:
+          TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then echo "present=true" >> "$GITHUB_OUTPUT"
+          else echo "::notice::CLAUDE_CODE_OAUTH_TOKEN is not set; skipping AI review"; fi
+      - uses: actions/checkout@v4
+        if: steps.token.outputs.present == 'true'
+        with:
+          fetch-depth: 1
+      - uses: anthropics/claude-code-action@5eb090f3c3afd701a0672cd32981197ca27688f6 # v1.0.253
+        if: steps.token.outputs.present == 'true' && env.TIER != '3'
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ github.token }}
@@ -121,5 +262,358 @@ jobs:
 
             Silence beats noise: post nothing you have not verified. Do not approve or request changes.
           claude_args: |
+            --model ${{ env.TIER == '2' && 'claude-opus-5-5' || 'claude-sonnet-5-5' }}
             --max-turns 40
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Read,Grep,Glob"
+      - name: Require both T3 review passes
+        if: steps.token.outputs.present == 'true' && env.TIER == '3' && needs.review-pass.result != 'success'
+        env:
+          PASS_RESULT: ${{ needs.review-pass.result }}
+        run: |
+          echo "::error::A T3 review pass concluded '$PASS_RESULT'; there is nothing to agree on."
+          exit 1
+      - uses: actions/download-artifact@v4
+        if: steps.token.outputs.present == 'true' && env.TIER == '3'
+        with:
+          name: findings-pass-1
+          path: ${{ runner.temp }}/pass-1
+      - uses: actions/download-artifact@v4
+        if: steps.token.outputs.present == 'true' && env.TIER == '3'
+        with:
+          name: findings-pass-2
+          path: ${{ runner.temp }}/pass-2
+      - name: Load gate scripts from the base branch
+        if: steps.token.outputs.present == 'true' && env.TIER == '3'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          # Run the base branch's gate, never the PR's copy: a PR must not edit its own classifier.
+          # The PR copy is used only when the base has none yet (the install PR itself).
+          ref=HEAD
+          if [ -n "$BASE_REF" ]; then
+            if git rev-parse -q --verify "origin/$BASE_REF" >/dev/null; then ref="origin/$BASE_REF"
+            else git fetch -q --depth=1 origin "$BASE_REF" && ref=FETCH_HEAD; fi
+          fi
+          mkdir -p "$RUNNER_TEMP/gate"
+          for f in classify check_attribution agree review_loop risk-policy.toml; do
+            git show "$ref:.github/pr-gate/$f" > "$RUNNER_TEMP/gate/$f" 2>/dev/null \
+              || cp ".github/pr-gate/$f" "$RUNNER_TEMP/gate/$f" 2>/dev/null \
+              || rm -f "$RUNNER_TEMP/gate/$f"
+          done
+      - name: Post the findings both passes agree on
+        if: steps.token.outputs.present == 'true' && env.TIER == '3'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 "$RUNNER_TEMP/gate/agree" "$RUNNER_TEMP/pass-1/findings.json" \
+            "$RUNNER_TEMP/pass-2/findings.json" --out "$RUNNER_TEMP/agreed.json" > "$RUNNER_TEMP/counts.json"
+          agreed=$(jq .agreed "$RUNNER_TEMP/counts.json")
+          dropped=$(jq .dropped "$RUNNER_TEMP/counts.json")
+          unposted="$RUNNER_TEMP/unposted.md"
+          : > "$unposted"
+          posted=0
+          # A line outside the diff makes the API answer 422; keep that finding for the summary.
+          while IFS= read -r payload; do
+            if gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/comments" --input - <<< "$payload" \
+                > /dev/null 2> "$RUNNER_TEMP/err.txt"; then
+              posted=$((posted + 1))
+            else
+              where=$(jq -r '"\(.path):\(.line)"' <<< "$payload")
+              echo "::warning::Inline comment on $where failed: $(tr '\n' ' ' < "$RUNNER_TEMP/err.txt")"
+              jq -r '"- `\(.path):\(.line)` \(.body)"' <<< "$payload" >> "$unposted"
+            fi
+          done < <(jq -c --arg sha "$HEAD_SHA" \
+            '.[] | {commit_id: $sha, path, line, side: "RIGHT", body}' "$RUNNER_TEMP/agreed.json")
+          summary="$RUNNER_TEMP/summary.md"
+          {
+            echo "pr-gate review (T3, 2 Opus passes): $agreed agreed findings ($posted posted inline)," \
+              "$dropped dropped for lack of agreement between the passes."
+            if [ -s "$unposted" ]; then
+              printf '\nAgreed findings that could not be placed on a diff line:\n\n'
+              cat "$unposted"
+            fi
+          } > "$summary"
+          cat "$summary"
+          gh pr comment "$PR" --body-file "$summary"
+      # Sets the job output before the failing step, so the fix job can read it from a red review.
+      - name: Count blocking findings on the head commit
+        id: blocking
+        if: steps.token.outputs.present == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # original_commit_id stays on the commit a comment was made on; commit_id moves forward.
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/comments" --paginate --jq '.[]
+            | select(.original_commit_id == env.HEAD_SHA and .user.login == "github-actions[bot]" and (.body | startswith("issue (blocking):")))
+            | .id' > "$RUNNER_TEMP/blocking-ids.txt"
+          count=$(wc -l < "$RUNNER_TEMP/blocking-ids.txt" | tr -d ' ')
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "$count blocking findings on $HEAD_SHA"
+      - name: Fail on blocking findings
+        if: steps.blocking.outputs.count > 0
+        env:
+          COUNT: ${{ steps.blocking.outputs.count }}
+        run: |
+          echo "::error::$COUNT blocking review finding(s) on the head commit; fix them before merging."
+          exit 1
+
+  # Same-repo PRs only: fix the review's blocking findings as one "fix(review): " commit pushed with
+  # PR_GATE_PUSH_TOKEN (a GITHUB_TOKEN push would not re-run the gate). review_loop holds the round
+  # cap; after it is used up a human takes over. Every refusal comments and exits 0: the red
+  # review check already blocks the merge.
+  fix:
+    needs: [classify, review]
+    # !cancelled(), not always(): a newer push cancels this run, and its stale fix must not start.
+    if: >-
+      !cancelled() && needs.review.outputs.blocking > 0 &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+    outputs:
+      ok: ${{ steps.bundle.outputs.ok }}
+      start: ${{ steps.rounds.outputs.start }}
+      sha: ${{ steps.bundle.outputs.sha }}
+      rounds: ${{ steps.rounds.outputs.rounds }}
+      max: ${{ steps.rounds.outputs.max }}
+    env:
+      TIER: ${{ needs.classify.outputs.tier }}
+      PR: ${{ github.event.pull_request.number }}
+      HEAD_REF: ${{ github.head_ref }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      GH_TOKEN: ${{ github.token }}
+      GIT_AUTHOR_NAME: pr-gate
+      GIT_AUTHOR_EMAIL: pr-gate@users.noreply.github.com
+      GIT_COMMITTER_NAME: pr-gate
+      GIT_COMMITTER_EMAIL: pr-gate@users.noreply.github.com
+    steps:
+      - name: Check for the review and push tokens
+        id: token
+        env:
+          REVIEW_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          PUSH_TOKEN: ${{ secrets.PR_GATE_PUSH_TOKEN }}
+        run: |
+          if [ -n "$REVIEW_TOKEN" ] && [ -n "$PUSH_TOKEN" ]; then echo "present=true" >> "$GITHUB_OUTPUT"
+          else echo "::notice::CLAUDE_CODE_OAUTH_TOKEN or PR_GATE_PUSH_TOKEN is not set; skipping the review-fix loop"; fi
+      # The head branch, not the merge commit. The agent and the repo's tests run in this job, and
+      # anything they leave behind (git hooks, config, background processes) would see a token
+      # used here, so the PAT stays out of this job and the push-fix job pushes the commit.
+      - uses: actions/checkout@v4
+        if: steps.token.outputs.present == 'true'
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Load gate scripts from the base branch
+        if: steps.token.outputs.present == 'true'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          # Run the base branch's gate, never the PR's copy: a PR must not edit its own classifier.
+          # The PR copy is used only when the base has none yet (the install PR itself).
+          ref=HEAD
+          if [ -n "$BASE_REF" ]; then
+            if git rev-parse -q --verify "origin/$BASE_REF" >/dev/null; then ref="origin/$BASE_REF"
+            else git fetch -q --depth=1 origin "$BASE_REF" && ref=FETCH_HEAD; fi
+          fi
+          mkdir -p "$RUNNER_TEMP/gate"
+          for f in classify check_attribution agree review_loop risk-policy.toml; do
+            git show "$ref:.github/pr-gate/$f" > "$RUNNER_TEMP/gate/$f" 2>/dev/null \
+              || cp ".github/pr-gate/$f" "$RUNNER_TEMP/gate/$f" 2>/dev/null \
+              || rm -f "$RUNNER_TEMP/gate/$f"
+          done
+      - name: Count review-fix rounds
+        id: rounds
+        if: steps.token.outputs.present == 'true'
+        run: |
+          for f in review_loop check_attribution; do
+            if [ ! -f "$RUNNER_TEMP/gate/$f" ]; then
+              echo "::notice::.github/pr-gate/$f is missing; re-run install.py. Skipping the review-fix loop."
+              exit 0
+            fi
+          done
+          if [ "$(git rev-parse HEAD)" != "$HEAD_SHA" ]; then
+            echo "::notice::$HEAD_REF moved past the reviewed commit $HEAD_SHA; the newer push gets its own run."
+            exit 0
+          fi
+          echo "start=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          gh pr view "$PR" -R "$GITHUB_REPOSITORY" --json commits --jq '.commits[].messageHeadline' \
+            > "$RUNNER_TEMP/subjects.txt"
+          python3 "$RUNNER_TEMP/gate/review_loop" rounds < "$RUNNER_TEMP/subjects.txt" > "$RUNNER_TEMP/rounds.txt"
+          cat "$RUNNER_TEMP/rounds.txt" >> "$GITHUB_OUTPUT"
+          rounds=$(sed -n 's/^rounds=//p' "$RUNNER_TEMP/rounds.txt")
+          max=$(sed -n 's/^max=//p' "$RUNNER_TEMP/rounds.txt")
+          echo "$rounds of $max review-fix rounds used"
+          if [ "$rounds" -lt "$max" ]; then echo "go=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          export NOTE="pr-gate fix: $max review-fix rounds used; handing to a human."
+          posted=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
+            --jq '.[] | select(.body | startswith(env.NOTE)) | .id')
+          if [ -z "$posted" ]; then gh pr comment "$PR" --body "$NOTE"; fi
+      - name: Write the blocking findings
+        id: findings
+        if: steps.rounds.outputs.go == 'true'
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/comments" --paginate --jq '.[]
+            | select(.original_commit_id == env.HEAD_SHA and .user.login == "github-actions[bot]" and (.body | startswith("issue (blocking):")))
+            | {path, line, body}' > "$RUNNER_TEMP/findings.jsonl"
+          jq -s . "$RUNNER_TEMP/findings.jsonl" > "$RUNNER_TEMP/findings.json"
+          count=$(jq length "$RUNNER_TEMP/findings.json")
+          if [ "$count" -eq 0 ]; then
+            echo "::notice::No blocking findings left on $HEAD_SHA; nothing to fix."
+            exit 0
+          fi
+          echo "$count blocking findings to fix"
+          echo "json=$(jq -c . "$RUNNER_TEMP/findings.json")" >> "$GITHUB_OUTPUT"
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+      - name: Set the commit identity
+        if: steps.findings.outputs.ready == 'true'
+        run: |
+          git config user.name "$GIT_AUTHOR_NAME"
+          git config user.email "$GIT_AUTHOR_EMAIL"
+      - uses: anthropics/claude-code-action@5eb090f3c3afd701a0672cd32981197ca27688f6 # v1.0.253
+        id: claude
+        if: steps.findings.outputs.ready == 'true'
+        continue-on-error: true
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+            RISK TIER: T${{ needs.classify.outputs.tier }}
+
+            The pr-gate review left these blocking findings on this pull request's head commit
+            (also saved as ${{ runner.temp }}/findings.json), as a JSON list of {path, line, body}:
+
+            ${{ steps.findings.outputs.json }}
+
+            1. Fix every finding at its root cause. Do not suppress, skip or special-case the
+               failing input to make it go away.
+            2. For each finding add one regression test that fails before your fix and passes after it.
+            3. Never delete, skip or weaken an existing test or assertion.
+            4. Never edit anything under `.github/`.
+            5. If the repo has an obvious test command (python -m pytest, python -m unittest,
+               npm test), run it and make it pass.
+            6. Make exactly one commit with `git add` and `git commit`. Its subject starts with
+               `fix(review): ` and summarises the fixes. Add no co-author trailers and do not
+               mention AI tools anywhere in the message.
+            7. Do not push.
+          claude_args: |
+            --model ${{ env.TIER == '1' && 'claude-sonnet-5-5' || 'claude-opus-5-5' }}
+            --max-turns 60
+            --allowedTools "Read,Edit,Write,Grep,Glob,Bash(git add:*),Bash(git commit:*),Bash(git diff:*),Bash(git status:*),Bash(python -m pytest:*),Bash(python -m unittest:*),Bash(python3 -m pytest:*),Bash(python3 -m unittest:*),Bash(npm test:*)"
+      - name: Verify the fix commit
+        id: verify
+        if: steps.findings.outputs.ready == 'true'
+        env:
+          START: ${{ steps.rounds.outputs.start }}
+          AGENT_OUTCOME: ${{ steps.claude.outcome }}
+        run: |
+          gate="$RUNNER_TEMP/gate"
+          refuse() {
+            echo "::warning::pr-gate fix refused: $1"
+            gh pr comment "$PR" --body "pr-gate fix: refused ($1); human needed."
+            exit 0
+          }
+          [ "$AGENT_OUTCOME" = success ] || refuse "the fix agent concluded $AGENT_OUTCOME"
+          new=$(git rev-list --count "$START..HEAD")
+          [ "$new" = 1 ] || refuse "expected exactly one new commit, found $new"
+          # review_loop counts rounds by this prefix, so its own count is the prefix check.
+          prefixed=$(git log -1 --format=%s | python3 "$gate/review_loop" rounds | sed -n 's/^rounds=//p')
+          [ "$prefixed" = 1 ] || refuse "the commit subject does not start with 'fix(review): '"
+          author=$(git log -1 --format=%ae)
+          [ "$author" = "$GIT_AUTHOR_EMAIL" ] || refuse "the commit author is $author, not $GIT_AUTHOR_EMAIL"
+          if git diff --name-only "$START..HEAD" | grep -q '^\.github/'; then
+            refuse "the commit changes files under .github/"
+          fi
+          if ! python3 "$gate/review_loop" verify-fix "$START" HEAD > "$RUNNER_TEMP/verify.txt" 2>&1; then
+            cat "$RUNNER_TEMP/verify.txt"
+            refuse "$(sed 's/^FAIL //' "$RUNNER_TEMP/verify.txt" | paste -sd ';' - | sed 's/;/; /g')"
+          fi
+          if ! python3 "$gate/check_attribution" --range "$START..HEAD"; then
+            refuse "the commit message carries AI attribution"
+          fi
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+      - name: Bundle the fix commit
+        id: bundle
+        if: steps.verify.outputs.ok == 'true'
+        env:
+          START: ${{ steps.rounds.outputs.start }}
+        run: |
+          git bundle create "$RUNNER_TEMP/fix.bundle" "$START..HEAD"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        if: steps.bundle.outputs.ok == 'true'
+        with:
+          name: review-fix-bundle
+          path: ${{ runner.temp }}/fix.bundle
+          if-no-files-found: error
+          retention-days: 1
+
+  # The only job that pushes with PR_GATE_PUSH_TOKEN. It runs nothing from the PR: a fresh checkout of the
+  # reviewed commit, the verified fix commit from the bundle, and a push with hooks disabled.
+  push-fix:
+    needs: [fix]
+    if: "!cancelled() && needs.fix.outputs.ok == 'true'"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    env:
+      PR: ${{ github.event.pull_request.number }}
+      HEAD_REF: ${{ github.head_ref }}
+      START: ${{ needs.fix.outputs.start }}
+      FIX_SHA: ${{ needs.fix.outputs.sha }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.fix.outputs.start }}
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: review-fix-bundle
+          path: ${{ runner.temp }}/fix
+      - name: Push the fix to the PR branch
+        id: push
+        env:
+          PUSH_TOKEN: ${{ secrets.PR_GATE_PUSH_TOKEN }}
+        run: |
+          git bundle verify -q "$RUNNER_TEMP/fix/fix.bundle"
+          git fetch -q "$RUNNER_TEMP/fix/fix.bundle" HEAD
+          if [ "$(git rev-parse FETCH_HEAD)" != "$FIX_SHA" ] || [ "$(git rev-parse FETCH_HEAD^)" != "$START" ]; then
+            gh pr comment "$PR" --body "pr-gate fix: refused (the fix bundle is not the verified commit); human needed."
+            exit 0
+          fi
+          auth=$(printf 'x-access-token:%s' "$PUSH_TOKEN" | base64 | tr -d '\n')
+          unset PUSH_TOKEN
+          echo "::add-mask::$auth"
+          # An explicit URL and header, and no hooks, so nothing in the checkout changes where the
+          # push goes, which credential it uses, or who else sees it. Fast-forward only.
+          if git -c core.hooksPath=/dev/null -c "http.$GITHUB_SERVER_URL/.extraheader=AUTHORIZATION: basic $auth" \
+              push "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" "$FIX_SHA:refs/heads/$HEAD_REF"; then
+            echo "sha=$FIX_SHA" >> "$GITHUB_OUTPUT"
+          else
+            gh pr comment "$PR" --body "pr-gate fix: refused (the push to $HEAD_REF was rejected); human needed."
+          fi
+      # always(): the push starts a new run that cancels this one; the comment must still go out.
+      - name: Announce the pushed round
+        if: always() && steps.push.outputs.sha != ''
+        env:
+          SHA: ${{ steps.push.outputs.sha }}
+          ROUNDS: ${{ needs.fix.outputs.rounds }}
+          MAX: ${{ needs.fix.outputs.max }}
+        run: |
+          gh pr comment "$PR" --body "pr-gate fix: round $((ROUNDS + 1)) of $MAX pushed (${SHA:0:7}); the gate will re-run."
