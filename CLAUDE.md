@@ -48,3 +48,14 @@ Session note from YYYY-MM-DD. [Brief summary]
 - Analysis cached to `data/analysis_cache.json` and `data/analyses/{paper_id}.json`
 - Clustering: batch mode for >50 papers, merge with existing clusters
 - Chat: phrase matching for keyword pre-filter (prevents "com-b" matching "combinations")
+
+## Done means it works for the user
+
+Green CI doesn't make a feature, a fix, or any code change done. Before you call it done, use it
+the way its user will meet it, and read what they would see:
+
+- Run `python server.py`, open http://127.0.0.1:3000 in a browser (use the Claude in Chrome extension),
+  and click through the screen you changed: search, analysis, clustering, chat.
+- Read the rendered page and the browser console, not only the server log.
+- Put what you ran and what the user saw in the pull request body. If you couldn't try a change
+  this way, say so and why.
